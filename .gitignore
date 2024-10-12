@@ -1,0 +1,9 @@
+config.yml
+*.mp3
+*.exe
+model/
+el_stream_test.py
+eleven_labs_test.py
+sr_test.py
+whisper_test.py
+gpt_test.py
