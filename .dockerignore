@@ -1,0 +1,12 @@
+# Ignore .git and .gitignore files
+.git
+.gitignore
+
+# Other files
+*.mp3
+el_stream_test.py
+eleven_labs_test.py
+gpt_test.py
+mpv.exe
+sr_test.py
+whisper_test.py
