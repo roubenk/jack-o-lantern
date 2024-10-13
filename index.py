@@ -26,12 +26,16 @@ logging.basicConfig(
 VOICE_ID = config['eleven_labs']['voice_id']
 URL = config['eleven_labs']['url']
 ELEVENLABS_API_KEY = config['eleven_labs']['api_key']
-OPENAI_API_KEY = config['openai']['api_key']
+OPENAI_API_KEY = config['open_ai']['api_key']
 CHUNK_SIZE = config['general']['chunk_size']
 LOOP_PAUSE_TIME = config['general']['loop_pause_time']
 
 # Initialize speech recognizer
 r = sr.Recognizer()
+r.dynamic_energy_adjustment_damping = 0.15
+r.pause_threshold = 0.3
+r.non_speaking_duration = 0.2
+
 m = sr.Microphone(chunk_size=2048)
 
 def elevenlabs_stream(text):
