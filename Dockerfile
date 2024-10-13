@@ -27,4 +27,4 @@ EXPOSE 80
 ENV NAME Jack-o-Lantern
 
 # Run index.py when the container launches
-CMD ["python", "index.py", "--config config.yml"]
+CMD ["python", "index.py", "--config", "config.yml"]
