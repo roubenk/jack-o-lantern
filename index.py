@@ -8,9 +8,16 @@ import os
 import logging
 import time
 import yaml
+import argparse
+
+# Enable passing arguments to set Recognizer properties
+def parse_args():
+    parser = argparse.ArgumentParser(description='Jack-O-Lantern')
+    parser.add_argument('--config', type=str, default='config.yml', help='Path to the config file')
+    return parser.parse_args()
 
 # load config from yaml file
-with open('config.yml', 'r') as f:
+with open(parse_args().config, 'r') as f:
     try:
         config = yaml.safe_load(f)
     except yaml.YAMLError as e:
@@ -32,11 +39,12 @@ LOOP_PAUSE_TIME = config['general']['loop_pause_time']
 
 # Initialize speech recognizer
 r = sr.Recognizer()
-r.dynamic_energy_adjustment_damping = 0.15
-r.pause_threshold = 0.3
-r.non_speaking_duration = 0.2
+r.dynamic_energy_adjustment_damping = config['recognizer_properties']['dynamic_energy_adjustment_damping']
+r.pause_threshold = config['recognizer_properties']['pause_threshold']
+r.non_speaking_duration = config['recognizer_properties']['non_speaking_duration']
+r.energy_threshold = config['recognizer_properties']['energy_threshold']
 
-m = sr.Microphone(chunk_size=2048)
+m = sr.Microphone(chunk_size=config['microphone_properties']['chunk_size'])
 
 def elevenlabs_stream(text):
     def stream_audio():
