@@ -47,41 +47,37 @@ r.energy_threshold = config['recognizer_properties']['energy_threshold']
 m = sr.Microphone(chunk_size=config['microphone_properties']['chunk_size'])
 
 def elevenlabs_stream(text):
-    def stream_audio():
-        headers = {
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-            "xi-api-key": ELEVENLABS_API_KEY
-        }
+    headers = {
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+        "xi-api-key": ELEVENLABS_API_KEY
+    }
 
-        data = {
-            "text": text,
-            "model_id": "eleven_turbo_v2_5",
-            "optimize_streaming_latency": "5",
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.0
-            }
+    data = {
+        "text": text,
+        "model_id": "eleven_turbo_v2_5",
+        "optimize_streaming_latency": "5",
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.0
         }
-        
-        logger.info("Sending text-to-speech request...")
-        response = requests.post(URL, json=data, headers=headers, stream=True)
-
-        # use subprocess to pipe the audio to ffplay and play it
-        ffplay_cmd = ["ffplay", "-nodisp", "-autoexit", "-"]
-        ffplay_proc = subprocess.Popen(ffplay_cmd, stdin=subprocess.PIPE)
-        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-            if chunk:
-                ffplay_proc.stdin.write(chunk)
-                logger.info(f"Received {len(chunk)} bytes of audio data.")
-        
-        # close the ffplay process when finished
-        ffplay_proc.stdin.close()
-        ffplay_proc.wait()
+    }
     
-    # Start the audio streaming in a separate thread
-    threading.Thread(target=stream_audio).start()
+    logger.info("Sending text-to-speech request...")
+    response = requests.post(URL, json=data, headers=headers, stream=True)
 
+    # use subprocess to pipe the audio to ffplay and play it
+    ffplay_cmd = ["ffplay", "-nodisp", "-autoexit", "-"]
+    ffplay_proc = subprocess.Popen(ffplay_cmd, stdin=subprocess.PIPE)
+    for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+        if chunk:
+            ffplay_proc.stdin.write(chunk)
+            logger.info(f"Received {len(chunk)} bytes of audio data.")
+    
+    # close the ffplay process when finished
+    ffplay_proc.stdin.close()
+    ffplay_proc.wait()
+    
 
 # Function to handle speech recognition
 def listen_and_respond(r, audio):
@@ -131,6 +127,7 @@ openai_client = OpenAI()
 # Start listening in the background
 with m as source:
     r.adjust_for_ambient_noise(source)
+default_sampling_rate = m.SAMPLE_RATE
 stop_listening = r.listen_in_background(m, listen_and_respond, phrase_time_limit=5)
 logger.info('Started listening')
 
