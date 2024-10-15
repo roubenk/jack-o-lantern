@@ -36,6 +36,7 @@ ELEVENLABS_API_KEY = config['eleven_labs']['api_key']
 OPENAI_API_KEY = config['open_ai']['api_key']
 CHUNK_SIZE = config['general']['chunk_size']
 LOOP_PAUSE_TIME = config['general']['loop_pause_time']
+PHYSICAL_MIC_MUTE = config['general']['physical_mic_mute']
 
 # Initialize speech recognizer
 r = sr.Recognizer()
@@ -82,8 +83,9 @@ def elevenlabs_stream(text):
 # Function to handle speech recognition
 def listen_and_respond(r, audio):
 
-    mute_mic = subprocess.run(["amixer", "sset", "'Capture'", "nocap"])
-    logger.info(f"Muted mic: {mute_mic.stdout}")
+    if PHYSICAL_MIC_MUTE:
+        mute_mic = subprocess.run(["amixer", "sset", "'Capture'", "nocap"])
+        logger.info(f"Muted mic: {mute_mic.stdout}")
 
     try:
         logger.info("Recognizing audio...")
@@ -122,8 +124,10 @@ def listen_and_respond(r, audio):
     except sr.RequestError as e:
         print("Could not request results; {0}".format(e))
     finally: 
-        unmute_mic = subprocess.run(["amixer", "sset", "'Capture'", "cap"])
-        logger.info(f"Unmuted mic: {unmute_mic.stdout}")
+        if PHYSICAL_MIC_MUTE:
+            unmute_mic = subprocess.run(["amixer", "sset", "'Capture'", "cap"])
+            logger.info(f"Unmuted mic: {unmute_mic.stdout}")
+
 
 # Initialize OpenAI API client
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
@@ -132,7 +136,6 @@ openai_client = OpenAI()
 # Start listening in the background
 with m as source:
     r.adjust_for_ambient_noise(source)
-default_sampling_rate = m.SAMPLE_RATE
 stop_listening = r.listen_in_background(m, listen_and_respond, phrase_time_limit=5)
 logger.info('Started listening')
 
