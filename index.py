@@ -82,6 +82,9 @@ def elevenlabs_stream(text):
 # Function to handle speech recognition
 def listen_and_respond(r, audio):
 
+    mute_mic = subprocess.run(["amixer", "sset", "'Capture'", "nocap"])
+    logger.info(f"Muted mic: {mute_mic.stdout}")
+
     try:
         logger.info("Recognizing audio...")
         text = r.recognize_google(audio)
@@ -118,7 +121,9 @@ def listen_and_respond(r, audio):
         print("Could not understand audio")
     except sr.RequestError as e:
         print("Could not request results; {0}".format(e))
-
+    finally: 
+        unmute_mic = subprocess.run(["amixer", "sset", "'Capture'", "cap"])
+        logger.info(f"Unmuted mic: {unmute_mic.stdout}")
 
 # Initialize OpenAI API client
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
