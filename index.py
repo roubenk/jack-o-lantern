@@ -1,6 +1,7 @@
 import speech_recognition as sr
 import requests
 import subprocess
+import signal
 import threading
 from openai import OpenAI
 # from elevenlabs import stream, VoiceSettings
@@ -116,7 +117,7 @@ def listen_and_respond(r, audio):
         ai_text = completion.choices[0].message.content
         logger.info(f"AI Response: {ai_text}")
         
-        subprocess.Popen.terminate(lights)
+        lights.send_signal(signal.SIGINT)
 
         # Call ElevenLabs to speak
         logger.info("Speaking response...")
