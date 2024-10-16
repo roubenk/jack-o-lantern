@@ -86,6 +86,8 @@ def listen_and_respond(r, audio):
     if PHYSICAL_MIC_MUTE:
         mute_mic = subprocess.run(["amixer", "sset", "'Capture'", "nocap"])
         logger.info(f"Muted mic: {mute_mic.stdout}")
+    
+    lights = subprocess.Popen(["sudo", "python", "led_pulse_test.py"])
 
     try:
         logger.info("Recognizing audio...")
@@ -113,6 +115,8 @@ def listen_and_respond(r, audio):
         # Get response from OpenAI
         ai_text = completion.choices[0].message.content
         logger.info(f"AI Response: {ai_text}")
+        
+        subprocess.Popen.terminate(lights)
 
         # Call ElevenLabs to speak
         logger.info("Speaking response...")
