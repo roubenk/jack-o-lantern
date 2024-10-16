@@ -1,6 +1,7 @@
 import speech_recognition as sr
 import requests
 import subprocess
+import signal
 import threading
 # from elevenlabs import stream, VoiceSettings
 import sys
@@ -123,7 +124,7 @@ def listen_and_respond(r, audio):
         text = process_audio(audio)
         logger.info(f"AI response: {text}")
         
-        subprocess.Popen.terminate(lights)
+        lights.send_signal(signal.SIGINT)
 
         # Call ElevenLabs to speak
         if text is not None:
