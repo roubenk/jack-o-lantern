@@ -44,6 +44,7 @@ r.dynamic_energy_adjustment_damping = config['recognizer_properties']['dynamic_e
 r.pause_threshold = config['recognizer_properties']['pause_threshold']
 r.non_speaking_duration = config['recognizer_properties']['non_speaking_duration']
 r.energy_threshold = config['recognizer_properties']['energy_threshold']
+r.dynamic_energy_ratio = config['recognizer_properties']['dynamic_energy_ratio']
 
 m = sr.Microphone(chunk_size=config['microphone_properties']['chunk_size'])
 
