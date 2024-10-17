@@ -85,10 +85,13 @@ def elevenlabs_stream(text):
 def listen_and_respond(r, audio):
 
     if PHYSICAL_MIC_MUTE:
-        mute_mic = subprocess.run(["amixer", "sset", "'Capture'", "nocap"])
-        logger.info(f"Muted mic: {mute_mic.stdout}")
+        mute_mic = subprocess.run(
+            ["amixer", "sset", "'Capture'", "nocap"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+        )
+        logger.info(f"Muted mic.")
     
-    lights = subprocess.Popen(["sudo", "python", "led_pulse_test.py"])
+    thinking_lights = subprocess.Popen(["sudo", "python", "led_animations.py", "--thinking", "-c"])
 
     try:
         logger.info("Recognizing audio...")
@@ -117,21 +120,29 @@ def listen_and_respond(r, audio):
         ai_text = completion.choices[0].message.content
         logger.info(f"AI Response: {ai_text}")
         
-        lights.send_signal(signal.SIGINT)
+        thinking_lights.send_signal(signal.SIGINT)
+        
+        speaking_lights = subprocess.Popen(["sudo", "python", "led_animations.py", "--speaking", "-c"])
 
         # Call ElevenLabs to speak
         logger.info("Speaking response...")
         elevenlabs_stream(ai_text)
         # stream(text_to_speech_stream(ai_text))
+        
+        speaking_lights.send_signal(signal.SIGINT)
 
     except sr.UnknownValueError:
         print("Could not understand audio")
+        thinking_lights.send_signal(signal.SIGINT)
     except sr.RequestError as e:
         print("Could not request results; {0}".format(e))
+        thinking_lights.send_signal(signal.SIGINT)
     finally: 
         if PHYSICAL_MIC_MUTE:
-            unmute_mic = subprocess.run(["amixer", "sset", "'Capture'", "cap"])
-            logger.info(f"Unmuted mic: {unmute_mic.stdout}")
+            unmute_mic = subprocess.run(["amixer", "sset", "'Capture'", "cap"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+            )
+            logger.info(f"Unmuted mic.")
 
 
 # Initialize OpenAI API client
