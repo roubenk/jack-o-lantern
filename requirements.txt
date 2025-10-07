@@ -1,4 +1,5 @@
 elevenlabs
+google-cloud-speech
 numpy
 openai
 pyaudio
