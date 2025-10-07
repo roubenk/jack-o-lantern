@@ -34,6 +34,7 @@ VOICE_ID = config['eleven_labs']['voice_id']
 URL = config['eleven_labs']['url']
 ELEVENLABS_API_KEY = config['eleven_labs']['api_key']
 OPENAI_API_KEY = config['open_ai']['api_key']
+GOOGLE_CLOUD_KEY = config['google_cloud']['api_key']
 CHUNK_SIZE = config['general']['chunk_size']
 LOOP_PAUSE_TIME = config['general']['loop_pause_time']
 PHYSICAL_MIC_MUTE = config['general']['physical_mic_mute']
@@ -57,11 +58,10 @@ def elevenlabs_stream(text):
 
     data = {
         "text": text,
-        "model_id": "eleven_turbo_v2_5",
-        "optimize_streaming_latency": "5",
+        "model_id": "eleven_flash_v2_5",
         "voice_settings": {
             "stability": 0.5,
-            "similarity_boost": 0.0
+            "similarity_boost": 0.5
         }
     }
     
@@ -71,10 +71,12 @@ def elevenlabs_stream(text):
     # use subprocess to pipe the audio to ffplay and play it
     ffplay_cmd = ["ffplay", "-nodisp", "-autoexit", "-"]
     ffplay_proc = subprocess.Popen(ffplay_cmd, stdin=subprocess.PIPE)
+    chunk_progress = 0
     for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
         if chunk:
             ffplay_proc.stdin.write(chunk)
-            logger.info(f"Received {len(chunk)} bytes of audio data.")
+            chunk_progress += len(chunk)
+            logger.info(f"Received {chunk_progress} bytes of audio data.")
     
     # close the ffplay process when finished
     ffplay_proc.stdin.close()
@@ -96,12 +98,10 @@ def listen_and_respond(r, audio):
         # Send text to OpenAI API and get response
         logger.info("Sending text to OpenAI API...")
         completion = openai_client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4.1-nano",
             messages=[
                 {"role": "system", "content": """
-                    You are a spooky and sassy Jack-o-lantern named Jack. 
-                    Reply to users in the spirit of Halloween and keep your replies short and sweet.  
-                    Don't use too many hip phrases. Your replies should sound like the narrator of "Thriller".
+                    You are a spooky and sassy Jack-o-lantern named Jack. Reply to users in the spirit of Halloween, with a dramatic vibe. Keep your replies short (very short), dramatic, and fun.
                     """
                  },
                 {
