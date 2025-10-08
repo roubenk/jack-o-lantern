@@ -9,6 +9,7 @@ import logging
 import time
 import yaml
 import argparse
+from google_interface import process_audio
 
 # Enable passing arguments to set Recognizer properties
 def parse_args():
@@ -76,7 +77,7 @@ def elevenlabs_stream(text):
         if chunk:
             ffplay_proc.stdin.write(chunk)
             chunk_progress += len(chunk)
-            logger.info(f"Received {chunk_progress} bytes of audio data.")
+            # logger.info(f"Received {chunk_progress} bytes of audio data.")
     
     # close the ffplay process when finished
     ffplay_proc.stdin.close()
@@ -92,33 +93,16 @@ def listen_and_respond(r, audio):
 
     try:
         logger.info("Recognizing audio...")
-        text = r.recognize_google(audio)
-        logger.info(f"You said: {text}")
-
-        # Send text to OpenAI API and get response
-        logger.info("Sending text to OpenAI API...")
-        completion = openai_client.chat.completions.create(
-            model="gpt-4.1-nano",
-            messages=[
-                {"role": "system", "content": """
-                    You are a spooky and sassy Jack-o-lantern named Jack. Reply to users in the spirit of Halloween, with a dramatic vibe. Keep your replies short (very short), dramatic, and fun.
-                    """
-                 },
-                {
-                    "role": "user",
-                    "content": text
-                }
-            ]
-        )
-
-        # Get response from OpenAI
-        ai_text = completion.choices[0].message.content
-        logger.info(f"AI Response: {ai_text}")
+        text = process_audio(audio)
+        logger.info(f"AI response: {text}")
 
         # Call ElevenLabs to speak
-        logger.info("Speaking response...")
-        elevenlabs_stream(ai_text)
-        # stream(text_to_speech_stream(ai_text))
+        if text is not None:
+            logger.info("Speaking response...")
+            elevenlabs_stream(text)
+            # stream(text_to_speech_stream(ai_text))
+        else:
+            logger.info("Couldn't understand speech.")
 
     except sr.UnknownValueError:
         print("Could not understand audio")
