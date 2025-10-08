@@ -127,7 +127,7 @@ def listen_and_respond(r, audio):
         text = process_audio(audio)
         logger.info(f"AI response: {text}")
         
-        os.kill(thinking_lights.pid, signal.SIGINT)
+        thinking_lights.send_signal(signal.SIGINT)
         
         speaking_lights = subprocess.Popen(["sudo", "python", "led_animations.py", "--speaking", "-c"])
 
@@ -140,16 +140,16 @@ def listen_and_respond(r, audio):
         else:
             logger.info("Couldn't understand speech.")
         
-        # speaking_lights.send_signal(signal.SIGINT)
-        os.kill(speaking_lights.pid, signal.SIGINT)
+        speaking_lights.send_signal(signal.SIGINT)
+ 
 
     except sr.UnknownValueError:
         print("Could not understand audio")
-        os.kill(thinking_lights.pid, signal.SIGINT)
+        thinking_lights.send_signal(signal.SIGINT)
     except sr.RequestError as e:
         print("Could not request results; {0}".format(e))
-        os.kill(speaking_lights.pid, signal.SIGINT)
-    finally:
+        thinking_lights.send_signal(signal.SIGINT)
+    finally: 
         if PHYSICAL_MIC_MUTE:
             unmute_mic = subprocess.run(["amixer", "sset", "'Capture'", "cap"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
