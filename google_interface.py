@@ -1,4 +1,12 @@
 import requests
+import logging
+
+# initialize logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S")
 
 # 1. Set your Cloud Function URL
 # This is the trigger URL you get from the Google Cloud Console.
@@ -28,6 +36,7 @@ def to_convert_rate(sample_rate: int) -> int:
 def process_audio(audio_data):
     try:
         # 3. Read the audio file and convert to FLAC
+        logger.info("Converting audio to FLAC.")
         flac_audio_data = build_data(audio_data)
 
         # 4. Set headers to specify the content type
@@ -37,20 +46,20 @@ def process_audio(audio_data):
         }
 
         # 5. Send the POST request
-        print("Sending audio to the cloud... ☁️")
+        logger.info("Sending audio to the cloud... ☁️")
         response = requests.post(cloud_function_url, data=flac_audio_data, headers=headers)
 
         # 6. Handle the response from the Cloud Function
         if response.status_code == 200:
             # Success! The response.text contains the final text from the LLM.
             llm_response = response.text
-            print(f"✅ LLM Response: {llm_response}")
+            logger.info(f"✅ LLM Response: {llm_response}")
             return llm_response
         
         else:
             # If something went wrong, print the error.
-            print(f"❌ Error: {response.status_code}")
-            print(f"Message: {response.text}")
+            logger.error(f"❌ Error: {response.status_code}")
+            logger.error(f"Message: {response.text}")
 
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        logger.error(f"An unexpected error occurred: {e}")
