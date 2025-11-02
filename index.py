@@ -41,9 +41,14 @@ CHUNK_SIZE = config['general']['chunk_size']
 LOOP_PAUSE_TIME = config['general']['loop_pause_time']
 PHYSICAL_MIC_MUTE = config['general']['physical_mic_mute']
 
+# Unmute system microphone in case it was left muted in a crash
+unmute_cmd = ["amixer", "sset", "Capture", "cap"]
+unmute_proc = subprocess.Popen(unmute_cmd, stdin=subprocess.PIPE)
+
 # Initialize speech recognizer
 r = sr.Recognizer()
 r.dynamic_energy_adjustment_damping = config['recognizer_properties']['dynamic_energy_adjustment_damping']
+r.dynamic_energy_threshold = config['recognizer_properties']['dynamic_energy_threshold']
 r.pause_threshold = config['recognizer_properties']['pause_threshold']
 r.non_speaking_duration = config['recognizer_properties']['non_speaking_duration']
 r.energy_threshold = config['recognizer_properties']['energy_threshold']
@@ -60,7 +65,7 @@ def elevenlabs_stream(text):
 
     data = {
         "text": text,
-        "model_id": "eleven_flash_v2_5",
+        "model_id": "eleven_turbo_v2_5",
         "voice_settings": {
             "stability": 0.5,
             "similarity_boost": 0.5
@@ -136,8 +141,8 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 openai_client = OpenAI()
 
 # Start listening in the background
-with m as source:
-    r.adjust_for_ambient_noise(source)
+# with m as source:
+#     r.adjust_for_ambient_noise(source)
 stop_listening = r.listen_in_background(m, listen_and_respond, phrase_time_limit=5)
 logger.info('Started listening')
 
