@@ -1,5 +1,6 @@
 import requests
 import logging
+import time
 
 # initialize logger
 logger = logging.getLogger(__name__)
@@ -11,6 +12,9 @@ logging.basicConfig(
 # 1. Set your Cloud Function URL
 # This is the trigger URL you get from the Google Cloud Console.
 cloud_function_url = "https://jack-o-lantern-function-172068380765.us-west1.run.app"
+
+# Reuse one HTTPS connection across requests to avoid a TLS handshake per interaction
+session = requests.Session()
 
 # 2. Specify the path to your audio file
 # This could be a file you've just saved from the microphone.
@@ -37,7 +41,10 @@ def process_audio(audio_data):
     try:
         # 3. Read the audio file and convert to FLAC
         logger.info("Converting audio to FLAC.")
+        t_start = time.perf_counter()
         flac_audio_data = build_data(audio_data)
+        t_flac = time.perf_counter()
+        logger.info(f"[TIMING] FLAC conversion: {t_flac - t_start:.3f}s")
 
         # 4. Set headers to specify the content type
         # This tells your function that you're sending raw binary data.
@@ -47,7 +54,9 @@ def process_audio(audio_data):
 
         # 5. Send the POST request
         logger.info("Sending audio to the cloud... ☁️")
-        response = requests.post(cloud_function_url, data=flac_audio_data, headers=headers)
+        response = session.post(cloud_function_url, data=flac_audio_data, headers=headers)
+        t_cloud = time.perf_counter()
+        logger.info(f"[TIMING] Cloud round-trip (upload + STT + LLM): {t_cloud - t_flac:.3f}s")
 
         # 6. Handle the response from the Cloud Function
         if response.status_code == 200:

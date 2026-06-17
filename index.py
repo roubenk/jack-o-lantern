@@ -43,12 +43,16 @@ PHYSICAL_MIC_MUTE = config['general']['physical_mic_mute']
 # Initialize speech recognizer
 r = sr.Recognizer()
 r.dynamic_energy_adjustment_damping = config['recognizer_properties']['dynamic_energy_adjustment_damping']
+r.dynamic_energy_threshold = config['recognizer_properties']['dynamic_energy_threshold']
 r.pause_threshold = config['recognizer_properties']['pause_threshold']
 r.non_speaking_duration = config['recognizer_properties']['non_speaking_duration']
 r.energy_threshold = config['recognizer_properties']['energy_threshold']
 r.dynamic_energy_ratio = config['recognizer_properties']['dynamic_energy_ratio']
 
 m = sr.Microphone(chunk_size=config['microphone_properties']['chunk_size'])
+
+# Reuse one HTTPS connection to ElevenLabs to avoid a TLS handshake per interaction
+tts_session = requests.Session()
 
 def elevenlabs_stream(text):
     headers = {
@@ -67,14 +71,24 @@ def elevenlabs_stream(text):
     }
     
     logger.info("Sending text-to-speech request...")
-    response = requests.post(URL, json=data, headers=headers, stream=True)
+    t_request = time.perf_counter()
+    response = tts_session.post(URL, json=data, headers=headers, stream=True)
+    logger.info(f"[TIMING] TTS response headers received: {time.perf_counter() - t_request:.3f}s")
 
     # use subprocess to pipe the audio to ffplay and play it
-    ffplay_cmd = ["ffplay", "-nodisp", "-autoexit", "-"]
+    # Low-latency flags: skip format probing and input buffering so playback starts immediately
+    ffplay_cmd = ["ffplay", "-nodisp", "-autoexit",
+                  "-probesize", "32", "-analyzeduration", "0",
+                  "-fflags", "nobuffer", "-flags", "low_delay",
+                  "-f", "mp3", "-"]
     ffplay_proc = subprocess.Popen(ffplay_cmd, stdin=subprocess.PIPE)
     chunk_progress = 0
+    first_chunk = True
     for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
         if chunk:
+            if first_chunk:
+                logger.info(f"[TIMING] TTS first audio chunk piped to ffplay: {time.perf_counter() - t_request:.3f}s")
+                first_chunk = False
             ffplay_proc.stdin.write(chunk)
             chunk_progress += len(chunk)
             # logger.info(f"Received {chunk_progress} bytes of audio data.")
@@ -86,6 +100,7 @@ def elevenlabs_stream(text):
 
 # Function to handle speech recognition
 def listen_and_respond(r, audio):
+    t_phrase_end = time.perf_counter()
 
     if PHYSICAL_MIC_MUTE:
         mute_mic = subprocess.run(["amixer", "sset", "'Capture'", "nocap"])
@@ -99,6 +114,7 @@ def listen_and_respond(r, audio):
         # Call ElevenLabs to speak
         if text is not None:
             logger.info("Speaking response...")
+            logger.info(f"[TIMING] End of speech to TTS start: {time.perf_counter() - t_phrase_end:.3f}s")
             elevenlabs_stream(text)
             # stream(text_to_speech_stream(ai_text))
         else:
@@ -119,8 +135,8 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 openai_client = OpenAI()
 
 # Start listening in the background
-with m as source:
-    r.adjust_for_ambient_noise(source)
+# with m as source:
+#     r.listen(source)
 stop_listening = r.listen_in_background(m, listen_and_respond, phrase_time_limit=5)
 logger.info('Started listening')
 
