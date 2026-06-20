@@ -5,6 +5,7 @@ import threading
 from openai import OpenAI
 # from elevenlabs import stream, VoiceSettings
 import os
+import sys
 import logging
 import time
 import yaml
@@ -40,6 +41,11 @@ CHUNK_SIZE = config['general']['chunk_size']
 LOOP_PAUSE_TIME = config['general']['loop_pause_time']
 PHYSICAL_MIC_MUTE = config['general']['physical_mic_mute']
 
+# Request raw PCM from ElevenLabs (no MP3 decode on playback). 16-bit signed LE, mono.
+# Lower sample rate = less data to transfer/buffer; 22050 is plenty for speech.
+TTS_SAMPLE_RATE = 22050
+TTS_OUTPUT_FORMAT = f"pcm_{TTS_SAMPLE_RATE}"
+
 # Initialize speech recognizer
 r = sr.Recognizer()
 r.dynamic_energy_adjustment_damping = config['recognizer_properties']['dynamic_energy_adjustment_damping']
@@ -54,9 +60,20 @@ m = sr.Microphone(chunk_size=config['microphone_properties']['chunk_size'])
 # Reuse one HTTPS connection to ElevenLabs to avoid a TLS handshake per interaction
 tts_session = requests.Session()
 
+def build_player_cmd():
+    """Pick a raw-PCM player for the current platform.
+
+    aplay (ALSA) on the Pi is the lowest-latency option; on Windows we fall back
+    to ffplay reading raw PCM, which still avoids the MP3 decoder spin-up.
+    """
+    if sys.platform.startswith("win"):
+        return ["ffplay", "-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit",
+                "-f", "s16le", "-ar", str(TTS_SAMPLE_RATE), "-ch_layout", "mono", "-i", "-"]
+    return ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(TTS_SAMPLE_RATE), "-c", "1", "-"]
+
+
 def elevenlabs_stream(text):
     headers = {
-        "Accept": "audio/mpeg",
         "Content-Type": "application/json",
         "xi-api-key": ELEVENLABS_API_KEY
     }
@@ -72,30 +89,26 @@ def elevenlabs_stream(text):
     
     logger.info("Sending text-to-speech request...")
     t_request = time.perf_counter()
-    response = tts_session.post(URL, json=data, headers=headers, stream=True)
+    response = tts_session.post(URL, params={"output_format": TTS_OUTPUT_FORMAT},
+                                json=data, headers=headers, stream=True)
     logger.info(f"[TIMING] TTS response headers received: {time.perf_counter() - t_request:.3f}s")
 
-    # use subprocess to pipe the audio to ffplay and play it
-    # Low-latency flags: skip format probing and input buffering so playback starts immediately
-    ffplay_cmd = ["ffplay", "-nodisp", "-autoexit",
-                  "-probesize", "32", "-analyzeduration", "0",
-                  "-fflags", "nobuffer", "-flags", "low_delay",
-                  "-f", "mp3", "-"]
-    ffplay_proc = subprocess.Popen(ffplay_cmd, stdin=subprocess.PIPE)
+    # Pipe the raw PCM straight to the platform's audio player (no decode step)
+    player_proc = subprocess.Popen(build_player_cmd(), stdin=subprocess.PIPE)
     chunk_progress = 0
     first_chunk = True
     for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
         if chunk:
             if first_chunk:
-                logger.info(f"[TIMING] TTS first audio chunk piped to ffplay: {time.perf_counter() - t_request:.3f}s")
+                logger.info(f"[TIMING] TTS first audio chunk piped to player: {time.perf_counter() - t_request:.3f}s")
                 first_chunk = False
-            ffplay_proc.stdin.write(chunk)
+            player_proc.stdin.write(chunk)
             chunk_progress += len(chunk)
             # logger.info(f"Received {chunk_progress} bytes of audio data.")
-    
-    # close the ffplay process when finished
-    ffplay_proc.stdin.close()
-    ffplay_proc.wait()
+
+    # close the player process when finished
+    player_proc.stdin.close()
+    player_proc.wait()
     
 
 # Function to handle speech recognition
