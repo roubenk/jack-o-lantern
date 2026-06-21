@@ -2,9 +2,7 @@ import speech_recognition as sr
 import requests
 import subprocess
 import threading
-from openai import OpenAI
 # from elevenlabs import stream, VoiceSettings
-import os
 import sys
 import logging
 import time
@@ -35,7 +33,6 @@ logging.basicConfig(
 VOICE_ID = config['eleven_labs']['voice_id']
 URL = config['eleven_labs']['url']
 ELEVENLABS_API_KEY = config['eleven_labs']['api_key']
-OPENAI_API_KEY = config['open_ai']['api_key']
 GOOGLE_CLOUD_KEY = config['google_cloud']['api_key']
 CHUNK_SIZE = config['general']['chunk_size']
 LOOP_PAUSE_TIME = config['general']['loop_pause_time']
@@ -142,10 +139,6 @@ def listen_and_respond(r, audio):
             unmute_mic = subprocess.run(["amixer", "sset", "'Capture'", "cap"])
             logger.info(f"Unmuted mic: {unmute_mic.stdout}")
 
-
-# Initialize OpenAI API client
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-openai_client = OpenAI()
 
 # Start listening in the background
 # with m as source:
