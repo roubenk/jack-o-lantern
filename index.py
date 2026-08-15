@@ -120,36 +120,40 @@ def listen_and_respond(r, audio):
         )
         logger.info(f"Muted mic.")
     
-    thinking_lights = subprocess.Popen(["sudo", "python", "led_animations.py", "--thinking", "-c"])
+    thinking_lights = None
+    speaking_lights = None
 
     try:
+        thinking_lights = subprocess.Popen(["sudo", "python", "led_animations.py", "--thinking", "-c"])
+
         logger.info("Recognizing audio...")
         text = process_audio(audio)
         logger.info(f"AI response: {text}")
-        
+
+        # Recognition done: stop the thinking animation before anything else runs
         thinking_lights.send_signal(signal.SIGINT)
-        
-        speaking_lights = subprocess.Popen(["sudo", "python", "led_animations.py", "--speaking", "-c"])
+        thinking_lights = None
 
         # Call ElevenLabs to speak
         if text is not None:
+            speaking_lights = subprocess.Popen(["sudo", "python", "led_animations.py", "--speaking", "-c"])
             logger.info("Speaking response...")
             logger.info(f"[TIMING] End of speech to TTS start: {time.perf_counter() - t_phrase_end:.3f}s")
             elevenlabs_stream(text)
             # stream(text_to_speech_stream(ai_text))
         else:
             logger.info("Couldn't understand speech.")
-        
-        speaking_lights.send_signal(signal.SIGINT)
- 
 
     except sr.UnknownValueError:
         print("Could not understand audio")
-        thinking_lights.send_signal(signal.SIGINT)
     except sr.RequestError as e:
         print("Could not request results; {0}".format(e))
-        thinking_lights.send_signal(signal.SIGINT)
-    finally: 
+    finally:
+        # Always stop any LED animation still running, on every exit path
+        for lights in (thinking_lights, speaking_lights):
+            if lights is not None:
+                lights.send_signal(signal.SIGINT)
+
         if PHYSICAL_MIC_MUTE:
             unmute_mic = subprocess.run(["amixer", "sset", "'Capture'", "cap"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
