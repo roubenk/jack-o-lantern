@@ -149,13 +149,31 @@ def handle_audio(audio):
                 lights.send_signal(signal.SIGINT)
 
 
-def drain_mic(source):
-    """Discard audio the mic buffered while Jack was busy.
+def pause_capture(source):
+    """Stop capturing so nothing said while Jack is busy is ever buffered."""
+    try:
+        source.stream.pyaudio_stream.stop_stream()
+    except Exception as e:
+        # If we can't stop the stream, drain_mic on resume is the fallback.
+        logger.warning(f"Could not pause mic capture: {e}")
 
-    While handle_audio runs, nothing reads the stream, so PortAudio keeps
-    buffering input - including Jack's own voice coming back through the speaker.
-    Dropping that backlog before we listen again stops Jack from re-triggering
-    itself, without muting the sound card at the system level.
+
+def resume_capture(source):
+    """Resume capturing once Jack has finished speaking."""
+    try:
+        if not source.stream.pyaudio_stream.is_active():
+            source.stream.pyaudio_stream.start_stream()
+    except Exception as e:
+        logger.warning(f"Could not resume mic capture: {e}")
+
+
+def drain_mic(source):
+    """Discard any audio left buffered on the mic stream.
+
+    Belt-and-suspenders after resume: with capture stopped during playback there
+    should be little to nothing here, but this clears anything the driver latched
+    across the stop/start so Jack never acts on his own voice or on speech that
+    happened while he was talking.
     """
     try:
         pending = source.stream.pyaudio_stream.get_read_available()
@@ -167,13 +185,19 @@ def drain_mic(source):
         logger.warning(f"Could not flush mic buffer: {e}")
 
 
-# Listen in the foreground: recognize, respond, flush the mic buffer, repeat.
+# Listen in the foreground. While Jack thinks and speaks we stop the mic stream
+# entirely so nothing is captured, then flush any residual and resume. This keeps
+# Jack half-duplex: he ignores everything said while he is talking.
 logger.info("Started listening")
 try:
     with m as source:
         while True:
             audio = r.listen(source, phrase_time_limit=PHRASE_TIME_LIMIT)
-            handle_audio(audio)
-            drain_mic(source)
+            pause_capture(source)
+            try:
+                handle_audio(audio)
+            finally:
+                resume_capture(source)
+                drain_mic(source)
 except KeyboardInterrupt:
     logger.info("Stopping.")
