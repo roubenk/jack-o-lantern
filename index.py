@@ -1,6 +1,7 @@
 import speech_recognition as sr
 import requests
 import subprocess
+import signal
 import threading
 # from elevenlabs import stream, VoiceSettings
 import sys
@@ -113,13 +114,22 @@ def listen_and_respond(r, audio):
     t_phrase_end = time.perf_counter()
 
     if PHYSICAL_MIC_MUTE:
-        mute_mic = subprocess.run(["amixer", "sset", "'Capture'", "nocap"])
-        logger.info(f"Muted mic: {mute_mic.stdout}")
+        mute_mic = subprocess.run(
+            ["amixer", "sset", "'Capture'", "nocap"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+        )
+        logger.info(f"Muted mic.")
+    
+    thinking_lights = subprocess.Popen(["sudo", "python", "led_animations.py", "--thinking", "-c"])
 
     try:
         logger.info("Recognizing audio...")
         text = process_audio(audio)
         logger.info(f"AI response: {text}")
+        
+        thinking_lights.send_signal(signal.SIGINT)
+        
+        speaking_lights = subprocess.Popen(["sudo", "python", "led_animations.py", "--speaking", "-c"])
 
         # Call ElevenLabs to speak
         if text is not None:
@@ -129,15 +139,22 @@ def listen_and_respond(r, audio):
             # stream(text_to_speech_stream(ai_text))
         else:
             logger.info("Couldn't understand speech.")
+        
+        speaking_lights.send_signal(signal.SIGINT)
+ 
 
     except sr.UnknownValueError:
         print("Could not understand audio")
+        thinking_lights.send_signal(signal.SIGINT)
     except sr.RequestError as e:
         print("Could not request results; {0}".format(e))
+        thinking_lights.send_signal(signal.SIGINT)
     finally: 
         if PHYSICAL_MIC_MUTE:
-            unmute_mic = subprocess.run(["amixer", "sset", "'Capture'", "cap"])
-            logger.info(f"Unmuted mic: {unmute_mic.stdout}")
+            unmute_mic = subprocess.run(["amixer", "sset", "'Capture'", "cap"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+            )
+            logger.info(f"Unmuted mic.")
 
 
 # Start listening in the background
