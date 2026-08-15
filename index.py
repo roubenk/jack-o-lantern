@@ -2,7 +2,6 @@ import speech_recognition as sr
 import requests
 import subprocess
 import signal
-import threading
 # from elevenlabs import stream, VoiceSettings
 import sys
 import logging
@@ -36,8 +35,10 @@ URL = config['eleven_labs']['url']
 ELEVENLABS_API_KEY = config['eleven_labs']['api_key']
 GOOGLE_CLOUD_KEY = config['google_cloud']['api_key']
 CHUNK_SIZE = config['general']['chunk_size']
-LOOP_PAUSE_TIME = config['general']['loop_pause_time']
-PHYSICAL_MIC_MUTE = config['general']['physical_mic_mute']
+# Hard cap on how long a single utterance is recorded before we cut it off.
+# pause_threshold (the silence gap) is what normally ends a phrase; this is just
+# a safety limit for someone who never stops talking. Falls back to 5s.
+PHRASE_TIME_LIMIT = config['general'].get('phrase_time_limit', 5)
 
 # Request raw PCM from ElevenLabs (no MP3 decode on playback). 16-bit signed LE, mono.
 # Lower sample rate = less data to transfer/buffer; 22050 is plenty for speech.
@@ -109,17 +110,10 @@ def elevenlabs_stream(text):
     player_proc.wait()
     
 
-# Function to handle speech recognition
-def listen_and_respond(r, audio):
+# Recognize the captured audio and speak the response
+def handle_audio(audio):
     t_phrase_end = time.perf_counter()
 
-    if PHYSICAL_MIC_MUTE:
-        mute_mic = subprocess.run(
-            ["amixer", "sset", "'Capture'", "nocap"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
-        )
-        logger.info(f"Muted mic.")
-    
     thinking_lights = None
     speaking_lights = None
 
@@ -154,24 +148,32 @@ def listen_and_respond(r, audio):
             if lights is not None:
                 lights.send_signal(signal.SIGINT)
 
-        if PHYSICAL_MIC_MUTE:
-            unmute_mic = subprocess.run(["amixer", "sset", "'Capture'", "cap"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
-            )
-            logger.info(f"Unmuted mic.")
+
+def drain_mic(source):
+    """Discard audio the mic buffered while Jack was busy.
+
+    While handle_audio runs, nothing reads the stream, so PortAudio keeps
+    buffering input - including Jack's own voice coming back through the speaker.
+    Dropping that backlog before we listen again stops Jack from re-triggering
+    itself, without muting the sound card at the system level.
+    """
+    try:
+        pending = source.stream.pyaudio_stream.get_read_available()
+        if pending > 0:
+            source.stream.read(pending)
+    except Exception as e:
+        # A failed flush at worst causes an occasional self-trigger; never let it
+        # take down the listen loop.
+        logger.warning(f"Could not flush mic buffer: {e}")
 
 
-# Start listening in the background
-# with m as source:
-#     r.listen(source)
-stop_listening = r.listen_in_background(m, listen_and_respond, phrase_time_limit=5)
-logger.info('Started listening')
-
-# Keep the program running
+# Listen in the foreground: recognize, respond, flush the mic buffer, repeat.
+logger.info("Started listening")
 try:
-    while True:
-        time.sleep(LOOP_PAUSE_TIME)
+    with m as source:
+        while True:
+            audio = r.listen(source, phrase_time_limit=PHRASE_TIME_LIMIT)
+            handle_audio(audio)
+            drain_mic(source)
 except KeyboardInterrupt:
-    logger.info('Stopping.')
-finally:
-    stop_listening(wait_for_stop=False)
+    logger.info("Stopping.")
