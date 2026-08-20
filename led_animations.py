@@ -104,10 +104,24 @@ if __name__ == '__main__':
     # Intialize the library (must be called once before other functions).
     strip.begin()
 
-    def settle_to_glow():
+    def settle_to_glow(fade=False):
         """Leave a dim orange idle glow (or dark if --glow is 0) and let the
-        WS281x pixels hold it after we exit - no running process needed."""
+        WS281x pixels hold it after we exit - no running process needed.
+
+        With fade=True, ramp down from full-brightness orange to the glow for a
+        smooth dim-down. Only safe from 'speaking' (colorWipe leaves the strip at
+        full orange); other states are already dim, so they snap instead.
+        """
         g = max(0, min(255, args.glow))
+        if fade:
+            level = 255
+            while level > g:
+                c = Color(level, int(level * 120 / 255), 0)
+                for i in range(strip.numPixels()):
+                    strip.setPixelColor(i, c)
+                strip.show()
+                time.sleep(0.015)
+                level -= 8
         # Keep the 255:120:0 orange hue while scaling brightness.
         color = Color(g, int(g * 120 / 255), 0)
         for i in range(strip.numPixels()):
@@ -123,6 +137,7 @@ if __name__ == '__main__':
     # over the LED hardware. index.py flips the state file (thinking -> speaking
     # -> idle); we read the current state each cycle and animate accordingly.
     # 'idle' (or a missing file) means the interaction is over: settle and exit.
+    last_state = "idle"
     try:
         if args.statefile is None:
             # One-shot: just set the idle glow (used at startup) and exit.
@@ -133,11 +148,15 @@ if __name__ == '__main__':
                 if state == "thinking":
                     # One iteration per cycle so we re-check the state ~6x/second.
                     theaterChase(strip, Color(255, 120, 0), iterations=1)
+                    last_state = state
                 elif state == "speaking":
                     colorWipe(strip, Color(255, 120, 0), 5)
+                    last_state = state
                 else:
                     break
     except KeyboardInterrupt:
         pass
     finally:
-        settle_to_glow()
+        # Fade down only when we were speaking (strip is at full orange); other
+        # exits are already dim, so snap straight to the glow to avoid a flash-up.
+        settle_to_glow(fade=(last_state == "speaking"))

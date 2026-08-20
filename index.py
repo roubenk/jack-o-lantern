@@ -244,3 +244,8 @@ try:
                 drain_mic(source)
 except KeyboardInterrupt:
     logger.info("Stopping.")
+finally:
+    # Turn the strip fully off when Jack shuts down (--glow 0), so a Ctrl-C
+    # doesn't leave the idle glow stuck on. run() blocks until it's done.
+    set_lights("idle")
+    subprocess.run(["sudo", "python", "led_animations.py", "--glow", "0"])
