@@ -6,6 +6,7 @@
 # various animations on a strip of NeoPixels.
 
 import time
+import signal
 from rpi_ws281x import *
 import argparse
 
@@ -93,15 +94,26 @@ if __name__ == '__main__':
 
     # print ('Press Ctrl-C to quit.')
 
+    # Treat SIGTERM like Ctrl-C so the parent's .terminate() also runs the
+    # clear-on-exit below. sudo forwards SIGTERM to us reliably, whereas it
+    # suppresses SIGINT sent from within its own process group - which is why
+    # signalling the animation to stop used to leave the LEDs stuck on.
+    def _stop(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _stop)
+
     try:
         while True:
             if args.thinking:
                 # print('Thinking animation')
                 theaterChase(strip, Color(255, 120, 0))
-                
+
             else:
                 # print('Speaking animation')
                 colorWipe(strip, Color(255 ,120, 0), 5)
-                
+
     except KeyboardInterrupt:
+        pass
+    finally:
+        # Always clear the strip on exit, whatever stopped us.
         colorWipe(strip, Color(0,0,0), 10)
