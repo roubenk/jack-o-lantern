@@ -1,7 +1,6 @@
 import speech_recognition as sr
 import requests
 import subprocess
-import signal
 # from elevenlabs import stream, VoiceSettings
 import sys
 import logging
@@ -125,7 +124,7 @@ def handle_audio(audio):
         logger.info(f"AI response: {text}")
 
         # Recognition done: stop the thinking animation before anything else runs
-        thinking_lights.send_signal(signal.SIGINT)
+        thinking_lights.terminate()
         thinking_lights = None
 
         # Call ElevenLabs to speak
@@ -143,10 +142,12 @@ def handle_audio(audio):
     except sr.RequestError as e:
         print("Could not request results; {0}".format(e))
     finally:
-        # Always stop any LED animation still running, on every exit path
+        # Always stop any LED animation still running, on every exit path.
+        # terminate() sends SIGTERM, which sudo reliably forwards to the LED
+        # process (SIGINT would get swallowed and leave the strip lit).
         for lights in (thinking_lights, speaking_lights):
             if lights is not None:
-                lights.send_signal(signal.SIGINT)
+                lights.terminate()
 
 
 def pause_capture(source):
