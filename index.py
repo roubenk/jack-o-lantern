@@ -29,6 +29,12 @@ logging.basicConfig(
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S")
 
+# A child process (audio player / sudo) can leave the TTY in raw mode, dropping
+# the newline->CR-LF mapping so log lines march diagonally down the screen.
+# Emit an explicit CR+LF so every line returns to column 0 regardless.
+for _handler in logging.getLogger().handlers:
+    _handler.terminator = "\r\n"
+
 VOICE_ID = config['eleven_labs']['voice_id']
 URL = config['eleven_labs']['url']
 ELEVENLABS_API_KEY = config['eleven_labs']['api_key']
