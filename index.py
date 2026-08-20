@@ -47,6 +47,10 @@ CHUNK_SIZE = config['general']['chunk_size']
 # a safety limit for someone who never stops talking. Falls back to 5s.
 PHRASE_TIME_LIMIT = config['general'].get('phrase_time_limit', 5)
 
+# Dim orange glow (0-255) the lantern holds between interactions. 0 = fully off
+# to save battery; higher = brighter idle glow but more continuous current draw.
+IDLE_GLOW_BRIGHTNESS = config['general'].get('idle_glow_brightness', 20)
+
 # Request raw PCM from ElevenLabs (no MP3 decode on playback). 16-bit signed LE, mono.
 # Lower sample rate = less data to transfer/buffer; 22050 is plenty for speech.
 TTS_SAMPLE_RATE = 22050
@@ -118,56 +122,56 @@ def elevenlabs_stream(text):
     
 
 # The LED script runs as root (via sudo) while index.py runs as a normal user,
-# so we can't reliably signal it to stop. Instead each animation polls a stop
-# file and exits its own loop when the file appears - which guarantees its
-# clear-on-exit runs, no signal delivery required.
-def start_lights(mode):
-    """Launch an LED animation ('thinking' or 'speaking'). Returns a handle."""
-    stopfile = os.path.join(tempfile.gettempdir(), f"jack_lights_{mode}")
-    try:
-        os.remove(stopfile)  # drop any stale sentinel so the new animation runs
-    except OSError:
-        pass
-    proc = subprocess.Popen(
-        ["sudo", "python", "led_animations.py", f"--{mode}", "--stopfile", stopfile]
-    )
-    return (proc, stopfile)
+# so we can't reliably signal it. Instead a SINGLE LED process drives the whole
+# interaction and reads its current mode from a state file we write here. One
+# process means two animations can never fight over the LED hardware, no matter
+# how fast the response comes back.
+_LIGHTS_STATEFILE = os.path.join(tempfile.gettempdir(), "jack_lights_state")
 
 
-def stop_lights(handle):
-    """Tell an animation to stop and clear the strip. Non-blocking - the process
-    notices the stop file within ~150ms and clears itself; the next animation can
-    start immediately (the strip tolerates the brief overlap)."""
-    if handle is None:
-        return
-    _proc, stopfile = handle
+def set_lights(state):
+    """Write the current LED state ('thinking', 'speaking', 'idle'). Non-blocking;
+    the running LED process picks it up on its next cycle (~150ms)."""
     try:
-        open(stopfile, "w").close()  # sentinel: animation sees it, exits, clears
+        with open(_LIGHTS_STATEFILE, "w") as f:
+            f.write(state)
     except OSError as e:
-        logger.warning(f"Could not signal LED stop: {e}")
+        logger.warning(f"Could not set LED state: {e}")
+
+
+def start_lights():
+    """Spawn the single LED process for one interaction, starting in 'thinking'.
+    It exits on its own once the state becomes 'idle', settling to the glow."""
+    set_lights("thinking")
+    return subprocess.Popen(
+        ["sudo", "python", "led_animations.py",
+         "--statefile", _LIGHTS_STATEFILE, "--glow", str(IDLE_GLOW_BRIGHTNESS)]
+    )
+
+
+def set_idle_glow():
+    """One-shot: leave the dim idle glow on the strip (used at startup, before the
+    first visitor)."""
+    subprocess.Popen(
+        ["sudo", "python", "led_animations.py", "--glow", str(IDLE_GLOW_BRIGHTNESS)]
+    )
 
 
 # Recognize the captured audio and speak the response
 def handle_audio(audio):
     t_phrase_end = time.perf_counter()
 
-    thinking_lights = None
-    speaking_lights = None
-
+    lights = None
     try:
-        thinking_lights = start_lights("thinking")
+        lights = start_lights()  # single process, starts in 'thinking'
 
         logger.info("Recognizing audio...")
         text = process_audio(audio)
         logger.info(f"AI response: {text}")
 
-        # Recognition done: stop the thinking animation before anything else runs
-        stop_lights(thinking_lights)
-        thinking_lights = None
-
         # Call ElevenLabs to speak
         if text is not None:
-            speaking_lights = start_lights("speaking")
+            set_lights("speaking")
             logger.info("Speaking response...")
             logger.info(f"[TIMING] End of speech to TTS start: {time.perf_counter() - t_phrase_end:.3f}s")
             elevenlabs_stream(text)
@@ -180,9 +184,9 @@ def handle_audio(audio):
     except sr.RequestError as e:
         print("Could not request results; {0}".format(e))
     finally:
-        # Always stop any LED animation still running, on every exit path.
-        for lights in (thinking_lights, speaking_lights):
-            stop_lights(lights)
+        # Interaction over (success, garbled speech, or error): the LED process
+        # reads 'idle', settles to the dim glow, and exits.
+        set_lights("idle")
 
 
 def pause_capture(source):
@@ -220,6 +224,9 @@ def drain_mic(source):
         # take down the listen loop.
         logger.warning(f"Could not flush mic buffer: {e}")
 
+
+# Settle the lantern into its dim idle glow while it waits for the first visitor.
+set_idle_glow()
 
 # Listen in the foreground. While Jack thinks and speaks we stop the mic stream
 # entirely so nothing is captured, then flush any residual and resume. This keeps
