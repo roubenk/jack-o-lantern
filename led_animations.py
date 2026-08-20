@@ -6,6 +6,7 @@
 # various animations on a strip of NeoPixels.
 
 import time
+import os
 import signal
 from rpi_ws281x import *
 import argparse
@@ -85,6 +86,8 @@ if __name__ == '__main__':
     parser.add_argument('-c', '--clear', action='store_true', help='clear the display on exit')
     parser.add_argument('-t', '--thinking', action='store_true', help='play thinking animation')
     parser.add_argument('-s', '--speaking', action='store_true', help='play speaking animation')
+    parser.add_argument('--stopfile', type=str, default=None,
+                        help='exit the animation as soon as this file appears')
     args = parser.parse_args()
 
     # Create NeoPixel object with appropriate configuration.
@@ -94,19 +97,22 @@ if __name__ == '__main__':
 
     # print ('Press Ctrl-C to quit.')
 
-    # Treat SIGTERM like Ctrl-C so the parent's .terminate() also runs the
-    # clear-on-exit below. sudo forwards SIGTERM to us reliably, whereas it
-    # suppresses SIGINT sent from within its own process group - which is why
-    # signalling the animation to stop used to leave the LEDs stuck on.
+    # index.py runs as a normal user and can't reliably signal this root
+    # process, so it asks us to stop by creating --stopfile. We poll for it once
+    # per animation cycle and exit the loop normally, which runs the clear below.
+    # The SIGTERM handler stays as a fallback for a direct `kill`/Ctrl-C.
     def _stop(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, _stop)
 
     try:
         while True:
+            if args.stopfile and os.path.exists(args.stopfile):
+                break
             if args.thinking:
                 # print('Thinking animation')
-                theaterChase(strip, Color(255, 120, 0))
+                # One iteration per cycle so we check the stop file ~6x/second.
+                theaterChase(strip, Color(255, 120, 0), iterations=1)
 
             else:
                 # print('Speaking animation')
@@ -115,5 +121,8 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         pass
     finally:
-        # Always clear the strip on exit, whatever stopped us.
-        colorWipe(strip, Color(0,0,0), 10)
+        # Always clear the strip on exit. Instant clear (single show) rather than
+        # a slow wipe, so it doesn't visibly fight the next animation.
+        for i in range(strip.numPixels()):
+            strip.setPixelColor(i, 0)
+        strip.show()
