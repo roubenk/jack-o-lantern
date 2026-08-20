@@ -79,15 +79,24 @@ def theaterChaseRainbow(strip, wait_ms=50):
             for i in range(0, strip.numPixels(), 3):
                 strip.setPixelColor(i+q, 0)
 
+def read_state(statefile):
+    """Return the current animation state written by index.py, or 'idle'."""
+    try:
+        with open(statefile) as f:
+            return f.read().strip()
+    except OSError:
+        return "idle"
+
+
 # Main program logic follows:
 if __name__ == '__main__':
     # Process arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('-c', '--clear', action='store_true', help='clear the display on exit')
-    parser.add_argument('-t', '--thinking', action='store_true', help='play thinking animation')
-    parser.add_argument('-s', '--speaking', action='store_true', help='play speaking animation')
-    parser.add_argument('--stopfile', type=str, default=None,
-                        help='exit the animation as soon as this file appears')
+    parser.add_argument('--statefile', type=str, default=None,
+                        help="poll this file for the current state "
+                             "('thinking', 'speaking', or 'idle')")
+    parser.add_argument('--glow', type=int, default=0,
+                        help='idle-glow brightness 0-255 to leave on the strip on exit')
     args = parser.parse_args()
 
     # Create NeoPixel object with appropriate configuration.
@@ -95,34 +104,40 @@ if __name__ == '__main__':
     # Intialize the library (must be called once before other functions).
     strip.begin()
 
-    # print ('Press Ctrl-C to quit.')
+    def settle_to_glow():
+        """Leave a dim orange idle glow (or dark if --glow is 0) and let the
+        WS281x pixels hold it after we exit - no running process needed."""
+        g = max(0, min(255, args.glow))
+        # Keep the 255:120:0 orange hue while scaling brightness.
+        color = Color(g, int(g * 120 / 255), 0)
+        for i in range(strip.numPixels()):
+            strip.setPixelColor(i, color)
+        strip.show()
 
-    # index.py runs as a normal user and can't reliably signal this root
-    # process, so it asks us to stop by creating --stopfile. We poll for it once
-    # per animation cycle and exit the loop normally, which runs the clear below.
-    # The SIGTERM handler stays as a fallback for a direct `kill`/Ctrl-C.
+    # SIGTERM fallback for a direct kill/Ctrl-C; normal stops come via statefile.
     def _stop(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, _stop)
 
+    # A single process drives the whole interaction so two processes never fight
+    # over the LED hardware. index.py flips the state file (thinking -> speaking
+    # -> idle); we read the current state each cycle and animate accordingly.
+    # 'idle' (or a missing file) means the interaction is over: settle and exit.
     try:
-        while True:
-            if args.stopfile and os.path.exists(args.stopfile):
-                break
-            if args.thinking:
-                # print('Thinking animation')
-                # One iteration per cycle so we check the stop file ~6x/second.
-                theaterChase(strip, Color(255, 120, 0), iterations=1)
-
-            else:
-                # print('Speaking animation')
-                colorWipe(strip, Color(255 ,120, 0), 5)
-
+        if args.statefile is None:
+            # One-shot: just set the idle glow (used at startup) and exit.
+            pass
+        else:
+            while True:
+                state = read_state(args.statefile)
+                if state == "thinking":
+                    # One iteration per cycle so we re-check the state ~6x/second.
+                    theaterChase(strip, Color(255, 120, 0), iterations=1)
+                elif state == "speaking":
+                    colorWipe(strip, Color(255, 120, 0), 5)
+                else:
+                    break
     except KeyboardInterrupt:
         pass
     finally:
-        # Always clear the strip on exit. Instant clear (single show) rather than
-        # a slow wipe, so it doesn't visibly fight the next animation.
-        for i in range(strip.numPixels()):
-            strip.setPixelColor(i, 0)
-        strip.show()
+        settle_to_glow()
