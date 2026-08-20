@@ -3,6 +3,8 @@ import requests
 import subprocess
 # from elevenlabs import stream, VoiceSettings
 import sys
+import os
+import tempfile
 import logging
 import time
 import yaml
@@ -115,6 +117,36 @@ def elevenlabs_stream(text):
     player_proc.wait()
     
 
+# The LED script runs as root (via sudo) while index.py runs as a normal user,
+# so we can't reliably signal it to stop. Instead each animation polls a stop
+# file and exits its own loop when the file appears - which guarantees its
+# clear-on-exit runs, no signal delivery required.
+def start_lights(mode):
+    """Launch an LED animation ('thinking' or 'speaking'). Returns a handle."""
+    stopfile = os.path.join(tempfile.gettempdir(), f"jack_lights_{mode}")
+    try:
+        os.remove(stopfile)  # drop any stale sentinel so the new animation runs
+    except OSError:
+        pass
+    proc = subprocess.Popen(
+        ["sudo", "python", "led_animations.py", f"--{mode}", "--stopfile", stopfile]
+    )
+    return (proc, stopfile)
+
+
+def stop_lights(handle):
+    """Tell an animation to stop and clear the strip. Non-blocking - the process
+    notices the stop file within ~150ms and clears itself; the next animation can
+    start immediately (the strip tolerates the brief overlap)."""
+    if handle is None:
+        return
+    _proc, stopfile = handle
+    try:
+        open(stopfile, "w").close()  # sentinel: animation sees it, exits, clears
+    except OSError as e:
+        logger.warning(f"Could not signal LED stop: {e}")
+
+
 # Recognize the captured audio and speak the response
 def handle_audio(audio):
     t_phrase_end = time.perf_counter()
@@ -123,19 +155,19 @@ def handle_audio(audio):
     speaking_lights = None
 
     try:
-        thinking_lights = subprocess.Popen(["sudo", "python", "led_animations.py", "--thinking", "-c"])
+        thinking_lights = start_lights("thinking")
 
         logger.info("Recognizing audio...")
         text = process_audio(audio)
         logger.info(f"AI response: {text}")
 
         # Recognition done: stop the thinking animation before anything else runs
-        thinking_lights.terminate()
+        stop_lights(thinking_lights)
         thinking_lights = None
 
         # Call ElevenLabs to speak
         if text is not None:
-            speaking_lights = subprocess.Popen(["sudo", "python", "led_animations.py", "--speaking", "-c"])
+            speaking_lights = start_lights("speaking")
             logger.info("Speaking response...")
             logger.info(f"[TIMING] End of speech to TTS start: {time.perf_counter() - t_phrase_end:.3f}s")
             elevenlabs_stream(text)
@@ -149,11 +181,8 @@ def handle_audio(audio):
         print("Could not request results; {0}".format(e))
     finally:
         # Always stop any LED animation still running, on every exit path.
-        # terminate() sends SIGTERM, which sudo reliably forwards to the LED
-        # process (SIGINT would get swallowed and leave the strip lit).
         for lights in (thinking_lights, speaking_lights):
-            if lights is not None:
-                lights.terminate()
+            stop_lights(lights)
 
 
 def pause_capture(source):
