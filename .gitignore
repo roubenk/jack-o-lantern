@@ -1,6 +1,7 @@
 config.yml
 __pycache__/
 samples/
+.vscode
 *.mp3
 *.exe
 model/

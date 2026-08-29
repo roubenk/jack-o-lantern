@@ -50,6 +50,14 @@ def respond_to_speech(request):
     Returns:
         The LLM's text response.
     """
+    # Warmup ping: the Pi fires this when the PIR sees someone approaching, to
+    # spin up (or keep) a warm instance before the visitor actually speaks. By the
+    # time this handler runs the module is imported and the clients below are
+    # built, so simply returning proves the instance is warm. Short-circuit here
+    # so a warmup never wastes a real STT call on an empty body.
+    if request.headers.get("X-Warmup"):
+        return "warm", 200
+
     if not GENAI_CLIENT:
         return "Internal Error: GenAI Client failed to initialize.", 500
     if not SPEECH_CLIENT:
