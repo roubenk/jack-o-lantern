@@ -54,15 +54,14 @@ PHRASE_TIME_LIMIT = config['general'].get('phrase_time_limit', 5)
 # to save battery; higher = brighter idle glow but more continuous current draw.
 IDLE_GLOW_BRIGHTNESS = config['general'].get('idle_glow_brightness', 20)
 
-# PIR (passive infrared) motion sensor settings. When someone approaches, the
-# sensor thread warms the cloud function and (when Jack is idle) requests a
-# proactive spoken greeting. See the `pir:` block in config.yml.
+# PIR (passive infrared) motion sensor settings. When someone approaches while
+# Jack is idle, he speaks a proactive greeting and warms the cloud function for
+# the conversation that's likely to follow. See the `pir:` block in config.yml.
 _pir_cfg = config.get('pir', {}) or {}
 PIR_ENABLED = _pir_cfg.get('enabled', False)
 PIR_GPIO = _pir_cfg.get('gpio', 16)
 GREETINGS_DIR = _pir_cfg.get('greetings_dir', 'greetings')
 PIR_STARTUP_IGNORE = _pir_cfg.get('startup_ignore_seconds', 60)
-PIR_WARMUP_COOLDOWN = _pir_cfg.get('warmup_cooldown', 10)
 PIR_GREETING_COOLDOWN = _pir_cfg.get('greeting_cooldown', 45)
 PIR_LISTEN_POLL_TIMEOUT = _pir_cfg.get('listen_poll_timeout', 1.0)
 
@@ -245,13 +244,17 @@ def drain_mic(source):
 # --- PIR motion sensor -------------------------------------------------------
 # The sensor runs in its own thread (gpiozero's callback). To keep the audio
 # device single-owner, that thread NEVER touches the mic/speaker/LEDs: it only
-# fires the (network) warmup and sets an event asking the main loop to greet.
-# The main loop owns all hardware and services the greeting inline between
-# listens. Cross-thread state is limited to `_greeting_request` (an Event) and
-# `_last_warmup` (written only by the sensor thread).
+# sets an event asking the main loop to greet. The main loop owns all hardware
+# and services the greeting inline between listens. Cross-thread state is limited
+# to `_greeting_request` (an Event).
+#
+# The cloud warmup is fired by the main loop when it actually greets, not on
+# every motion edge: a greeting is the moment a conversation is likely, and
+# Cloud Run stays warm for minutes, so a single warmup then covers the visit.
+# Warming on bare motion would just re-ping an already-warm instance (or warm
+# for a false trigger).
 _greeting_request = threading.Event()
 _pir_start = 0.0        # monotonic time the sensor was armed (for startup settle)
-_last_warmup = 0.0      # sensor thread only
 _pir_sensor = None      # keep a reference so gpiozero doesn't close the device
 _warmup_session = requests.Session()
 
@@ -269,16 +272,9 @@ def _warmup():
 
 def _on_motion():
     """gpiozero callback (sensor thread) fired on each rising edge of the PIR."""
-    now = time.monotonic()
     # Ignore the settling period after power-on, when PIRs emit false triggers.
-    if now - _pir_start < PIR_STARTUP_IGNORE:
+    if time.monotonic() - _pir_start < PIR_STARTUP_IGNORE:
         return
-
-    global _last_warmup
-    if now - _last_warmup >= PIR_WARMUP_COOLDOWN:
-        _last_warmup = now
-        threading.Thread(target=_warmup, daemon=True).start()
-
     # Ask the main loop to greet; it decides whether cooldowns allow it.
     _greeting_request.set()
 
@@ -357,6 +353,11 @@ try:
                         try:
                             start_lights("speaking")  # no thinking phase for a greeting
                             logger.info("PIR: speaking a proactive greeting")
+                            # A greeting is our best signal a conversation is
+                            # imminent, so warm the cloud now. Runs concurrently
+                            # with the clip, so the instance is hot before the
+                            # visitor answers.
+                            threading.Thread(target=_warmup, daemon=True).start()
                             play_greeting()
                         finally:
                             set_lights("idle")
