@@ -25,20 +25,35 @@ import yaml
 
 # Spooky, in-character one-liners Jack calls out when someone wanders near.
 # Keep them short and punchy -- they play unprompted, so brevity is a virtue.
+# The bracketed [tags] are eleven_v3 audio tags (see TTS_MODEL below): they
+# steer delivery -- laughter, whispers, tone -- and are NOT spoken aloud. They
+# only work on v3; on an older model they'd be read literally, so keep TTS_MODEL
+# and these tags in sync.
 GREETINGS = [
-    "Well, well, well... what do we have here?",
-    "Come closer... if you dare.",
-    "Ah, a fresh face for the harvest. Step right up.",
-    "I smell... a visitor. Don't be shy.",
-    "Heh heh heh... I've been waiting for you.",
-    "Who dares disturb my slumber? Come, say hello.",
-    "A living soul approaches. How delightful.",
-    "Don't just lurk in the shadows. Come chat with old Jack.",
+    "[low and menacing] Well, well, well... [chuckles darkly] what do we have here?",
+    "[whispers] Come closer... [ominous] if you dare.",
+    "[theatrical] Ah, a fresh face for the harvest. [delighted] Step right up.",
+    "[sniffs the air] I smell... a visitor. [coaxing] Don't be shy.",
+    "[slow, wicked laugh] Heh heh heh... [gleeful] I've been waiting for you.",
+    "[booming] Who dares disturb my slumber? [softening, inviting] Come, say hello.",
+    "[delighted] A living soul approaches. [savoring] How delightful.",
+    "[mock-scolding] Don't just lurk in the shadows. [warmly] Come chat with old Jack.",
 ]
 
 # Raw PCM format the player in index.py expects (must match TTS_SAMPLE_RATE there).
 TTS_SAMPLE_RATE = 22050
 TTS_OUTPUT_FORMAT = f"pcm_{TTS_SAMPLE_RATE}"
+
+# The live path in index.py uses a flash model for low latency, since a visitor
+# is waiting on the reply. This generator runs once, offline, with nobody
+# waiting -- so we spend that budget on quality. eleven_v3 is the most
+# expressive model (built for character/emotional delivery, and it understands
+# inline tags like [laughs] / [whispers]), which suits Jack's theatrical
+# one-liners better than the steadier-but-flatter multilingual_v2. It's slightly
+# less consistent take-to-take, but that's a non-issue here: this is a one-time
+# render, so just re-run and keep the good takes. Same voice (that lives in the
+# URL), so Jack still sounds like Jack -- just hammier.
+TTS_MODEL = "eleven_v3"
 
 
 def parse_args():
@@ -63,7 +78,7 @@ def main():
     for i, text in enumerate(GREETINGS):
         data = {
             "text": text,
-            "model_id": "eleven_flash_v2_5",
+            "model_id": TTS_MODEL,
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
         }
         print(f"[{i + 1}/{len(GREETINGS)}] {text}")
