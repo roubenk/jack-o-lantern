@@ -1,4 +1,5 @@
 elevenlabs
+gpiozero
 google-cloud-speech
 numpy
 openai

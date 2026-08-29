@@ -4,12 +4,15 @@ import subprocess
 # from elevenlabs import stream, VoiceSettings
 import sys
 import os
+import glob
+import random
 import tempfile
+import threading
 import logging
 import time
 import yaml
 import argparse
-from google_interface import process_audio
+from google_interface import process_audio, cloud_function_url
 
 # Enable passing arguments to set Recognizer properties
 def parse_args():
@@ -50,6 +53,18 @@ PHRASE_TIME_LIMIT = config['general'].get('phrase_time_limit', 5)
 # Dim orange glow (0-255) the lantern holds between interactions. 0 = fully off
 # to save battery; higher = brighter idle glow but more continuous current draw.
 IDLE_GLOW_BRIGHTNESS = config['general'].get('idle_glow_brightness', 20)
+
+# PIR (passive infrared) motion sensor settings. When someone approaches, the
+# sensor thread warms the cloud function and (when Jack is idle) requests a
+# proactive spoken greeting. See the `pir:` block in config.yml.
+_pir_cfg = config.get('pir', {}) or {}
+PIR_ENABLED = _pir_cfg.get('enabled', False)
+PIR_GPIO = _pir_cfg.get('gpio', 16)
+GREETINGS_DIR = _pir_cfg.get('greetings_dir', 'greetings')
+PIR_STARTUP_IGNORE = _pir_cfg.get('startup_ignore_seconds', 60)
+PIR_WARMUP_COOLDOWN = _pir_cfg.get('warmup_cooldown', 10)
+PIR_GREETING_COOLDOWN = _pir_cfg.get('greeting_cooldown', 45)
+PIR_LISTEN_POLL_TIMEOUT = _pir_cfg.get('listen_poll_timeout', 1.0)
 
 # Request raw PCM from ElevenLabs (no MP3 decode on playback). 16-bit signed LE, mono.
 # Lower sample rate = less data to transfer/buffer; 22050 is plenty for speech.
@@ -139,10 +154,12 @@ def set_lights(state):
         logger.warning(f"Could not set LED state: {e}")
 
 
-def start_lights():
-    """Spawn the single LED process for one interaction, starting in 'thinking'.
-    It exits on its own once the state becomes 'idle', settling to the glow."""
-    set_lights("thinking")
+def start_lights(initial="thinking"):
+    """Spawn the single LED process for one interaction, starting in `initial`
+    ('thinking' for a normal turn, 'speaking' for a proactive greeting that has
+    no thinking phase). It exits on its own once the state becomes 'idle',
+    settling to the glow."""
+    set_lights(initial)
     return subprocess.Popen(
         ["sudo", "python", "led_animations.py",
          "--statefile", _LIGHTS_STATEFILE, "--glow", str(IDLE_GLOW_BRIGHTNESS)]
@@ -225,23 +242,138 @@ def drain_mic(source):
         logger.warning(f"Could not flush mic buffer: {e}")
 
 
+# --- PIR motion sensor -------------------------------------------------------
+# The sensor runs in its own thread (gpiozero's callback). To keep the audio
+# device single-owner, that thread NEVER touches the mic/speaker/LEDs: it only
+# fires the (network) warmup and sets an event asking the main loop to greet.
+# The main loop owns all hardware and services the greeting inline between
+# listens. Cross-thread state is limited to `_greeting_request` (an Event) and
+# `_last_warmup` (written only by the sensor thread).
+_greeting_request = threading.Event()
+_pir_start = 0.0        # monotonic time the sensor was armed (for startup settle)
+_last_warmup = 0.0      # sensor thread only
+_pir_sensor = None      # keep a reference so gpiozero doesn't close the device
+_warmup_session = requests.Session()
+
+
+def _warmup():
+    """Ping the cloud function so an instance is warm before the visitor speaks.
+    Fire-and-forget on its own thread; failures are harmless (worst case the
+    first real request pays the cold start it always did)."""
+    try:
+        _warmup_session.post(cloud_function_url, headers={"X-Warmup": "1"}, timeout=8)
+        logger.info("PIR: warmed cloud function")
+    except Exception as e:
+        logger.warning(f"PIR warmup failed: {e}")
+
+
+def _on_motion():
+    """gpiozero callback (sensor thread) fired on each rising edge of the PIR."""
+    now = time.monotonic()
+    # Ignore the settling period after power-on, when PIRs emit false triggers.
+    if now - _pir_start < PIR_STARTUP_IGNORE:
+        return
+
+    global _last_warmup
+    if now - _last_warmup >= PIR_WARMUP_COOLDOWN:
+        _last_warmup = now
+        threading.Thread(target=_warmup, daemon=True).start()
+
+    # Ask the main loop to greet; it decides whether cooldowns allow it.
+    _greeting_request.set()
+
+
+def setup_pir():
+    """Arm the PIR sensor if enabled and the hardware library is present.
+    Safe to call on a dev machine: a missing gpiozero just leaves PIR off."""
+    global _pir_sensor, _pir_start
+    if not PIR_ENABLED:
+        logger.info("PIR disabled in config")
+        return
+    try:
+        from gpiozero import MotionSensor
+    except Exception as e:
+        logger.warning(f"gpiozero unavailable, PIR disabled: {e}")
+        return
+    try:
+        _pir_sensor = MotionSensor(PIR_GPIO)
+        _pir_sensor.when_motion = _on_motion
+        _pir_start = time.monotonic()
+        logger.info(
+            f"PIR armed on GPIO {PIR_GPIO} "
+            f"(ignoring motion for the first {PIR_STARTUP_IGNORE}s)"
+        )
+    except Exception as e:
+        logger.warning(f"Could not init PIR on GPIO {PIR_GPIO}: {e}")
+
+
+def play_greeting():
+    """Play a random pre-rendered greeting clip (raw PCM) through the same player
+    the streamed TTS uses. Returns False if there are no clips to play."""
+    clips = sorted(glob.glob(os.path.join(GREETINGS_DIR, "*.pcm")))
+    if not clips:
+        logger.warning(f"No greeting clips in {GREETINGS_DIR}/; skipping greeting")
+        return False
+    with open(random.choice(clips), "rb") as f:
+        pcm = f.read()
+    player_proc = subprocess.Popen(build_player_cmd(), stdin=subprocess.PIPE)
+    player_proc.stdin.write(pcm)
+    player_proc.stdin.close()
+    player_proc.wait()
+    return True
+
+
 # Settle the lantern into its dim idle glow while it waits for the first visitor.
 set_idle_glow()
+setup_pir()
 
 # Listen in the foreground. While Jack thinks and speaks we stop the mic stream
 # entirely so nothing is captured, then flush any residual and resume. This keeps
 # Jack half-duplex: he ignores everything said while he is talking.
+#
+# listen() carries a short timeout so the loop also wakes ~1x/sec while idle to
+# service a proactive greeting the PIR thread has requested. All mic/speaker/LED
+# work stays on this thread; the sensor thread only sets the request event.
 logger.info("Started listening")
+# monotonic timestamps gating proactive greetings (main thread only)
+_last_greeting = 0.0
+_last_interaction = 0.0
 try:
     with m as source:
         while True:
-            audio = r.listen(source, phrase_time_limit=PHRASE_TIME_LIMIT)
+            try:
+                audio = r.listen(source, timeout=PIR_LISTEN_POLL_TIMEOUT,
+                                 phrase_time_limit=PHRASE_TIME_LIMIT)
+            except sr.WaitTimeoutError:
+                # No speech this window. If the PIR asked for a greeting and the
+                # cooldowns allow it, greet now. A recent interaction suppresses
+                # greetings so we don't talk over an ongoing conversation.
+                if _greeting_request.is_set():
+                    _greeting_request.clear()
+                    now = time.monotonic()
+                    if (now - _last_greeting >= PIR_GREETING_COOLDOWN and
+                            now - _last_interaction >= PIR_GREETING_COOLDOWN):
+                        pause_capture(source)
+                        try:
+                            start_lights("speaking")  # no thinking phase for a greeting
+                            logger.info("PIR: speaking a proactive greeting")
+                            play_greeting()
+                        finally:
+                            set_lights("idle")
+                            resume_capture(source)
+                            drain_mic(source)
+                            _last_greeting = time.monotonic()
+                continue
+
             pause_capture(source)
             try:
                 handle_audio(audio)
             finally:
                 resume_capture(source)
                 drain_mic(source)
+                # A real interaction resets the greeting timer: the visitor is
+                # already engaged, so don't greet them on top of it.
+                _last_interaction = time.monotonic()
 except KeyboardInterrupt:
     logger.info("Stopping.")
 finally:
