@@ -220,8 +220,16 @@ def set_idle_glow():
 
 # Recognize the captured audio and speak the response
 def handle_audio(audio):
+    """Transcribe the captured audio and speak Jack's reply.
+
+    Returns True only if Jack actually said something back. `listen()` fires on
+    any loud-enough noise (a car door, wind, a dog), so "we captured audio" is
+    not the same as "someone talked to Jack" -- only a real reply counts as an
+    interaction for the greeting cooldown.
+    """
     t_phrase_end = time.perf_counter()
 
+    spoke = False
     try:
         start_lights()  # single process, starts in 'thinking'
 
@@ -236,6 +244,7 @@ def handle_audio(audio):
             logger.info("Speaking response...")
             logger.info(f"[TIMING] End of speech to TTS start: {time.perf_counter() - t_phrase_end:.3f}s")
             elevenlabs_stream(text)
+            spoke = True
         else:
             logger.info("Couldn't understand speech.")
 
@@ -247,6 +256,7 @@ def handle_audio(audio):
         # Interaction over (success, garbled speech, or error): the LED process
         # reads 'idle', settles to the dim glow, and exits.
         set_lights("idle")
+    return spoke
 
 
 def pause_capture(source):
@@ -371,7 +381,9 @@ def play_greeting():
     return True
 
 
-# monotonic timestamps gating proactive greetings (main thread only)
+# monotonic timestamps gating proactive greetings (main thread only).
+# _last_interaction marks the end of a real exchange -- one where Jack actually
+# replied -- not merely the last time the mic tripped.
 _last_greeting = 0.0
 _last_interaction = 0.0
 
@@ -433,13 +445,17 @@ try:
                     continue
 
                 pause_capture(source)
+                replied = False
                 try:
-                    handle_audio(audio)
+                    replied = handle_audio(audio)
                 finally:
                     resume_capture(source)
                     drain_mic(source)
-                    # A real interaction resets the greeting timer: the visitor is
-                    # already engaged, so don't greet them on top of it.
+                # Only a real exchange resets the greeting timer: that visitor is
+                # already engaged, so don't greet them on top of it. A false
+                # trigger (wind, a car door, a passing dog) produces no reply and
+                # must not mute Jack for the next visitor who actually shows up.
+                if replied:
                     _last_interaction = time.monotonic()
             except KeyboardInterrupt:
                 raise
