@@ -1,24 +1,38 @@
-import requests
 import logging
 import time
 
-# initialize logger
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S")
+import requests
 
-# 1. Set your Cloud Function URL
-# This is the trigger URL you get from the Google Cloud Console.
+logger = logging.getLogger(__name__)
+
+# Cloud Run URL of the speech -> LLM function.
 cloud_function_url = "https://jack-o-lantern-function-172068380765.us-west1.run.app"
+
+# Optional shared secret sent with every request. The endpoint is public, so
+# without it anyone who finds the URL can burn STT + Gemini quota on our bill.
+# Set `google_cloud.shared_secret` in config.yml and the matching
+# JACK_SHARED_SECRET env var on the Cloud Run service to turn it on.
+SECRET_HEADER = "X-Jack-Secret"
+_shared_secret = None
+
+# (connect, read) timeouts. Without these a hung cloud call blocks the main loop
+# forever with the mic paused and the LEDs stuck mid-animation.
+REQUEST_TIMEOUT = (5, 30)
 
 # Reuse one HTTPS connection across requests to avoid a TLS handshake per interaction
 session = requests.Session()
 
-# 2. Specify the path to your audio file
-# This could be a file you've just saved from the microphone.
-audio_file_path = "output.mp3"
+
+def set_shared_secret(secret):
+    """Install the shared secret read from config.yml (None/empty disables it)."""
+    global _shared_secret
+    _shared_secret = secret or None
+
+
+def auth_headers():
+    """Headers that authenticate us to the cloud function; empty if unconfigured."""
+    return {SECRET_HEADER: _shared_secret} if _shared_secret else {}
+
 
 def build_data(audio_data) -> bytes:
     flac_data = audio_data.get_flac_data(
@@ -27,48 +41,51 @@ def build_data(audio_data) -> bytes:
     )
     return flac_data
 
-def to_convert_rate(sample_rate: int) -> int:
-    """Audio samples must be at least 8 kHz
 
-    >>> RequestBuilder.to_convert_rate(16_000)
-    >>> RequestBuilder.to_convert_rate(8_000)
-    >>> RequestBuilder.to_convert_rate(7_999)
-    8000
+def to_convert_rate(sample_rate: int) -> int:
+    """Target rate for the FLAC conversion, or None to keep the mic's own rate.
+
+    Google needs at least 8 kHz, so anything slower is upsampled; anything at or
+    above it is passed through untouched (the rate is carried in the FLAC header).
     """
     return None if sample_rate >= 8000 else 8000
 
+
 def process_audio(audio_data):
+    """Send captured audio to the cloud function and return Jack's reply text.
+
+    Returns None if the audio could not be transcribed or the call failed; the
+    caller treats that as "say nothing".
+    """
     try:
-        # 3. Read the audio file and convert to FLAC
         logger.info("Converting audio to FLAC.")
         t_start = time.perf_counter()
         flac_audio_data = build_data(audio_data)
         t_flac = time.perf_counter()
         logger.info(f"[TIMING] FLAC conversion: {t_flac - t_start:.3f}s")
 
-        # 4. Set headers to specify the content type
-        # This tells your function that you're sending raw binary data.
-        headers = {
-            'Content-Type': 'audio/x-flac; rate=16000'
-        }
+        headers = {"Content-Type": "audio/x-flac"}
+        headers.update(auth_headers())
 
-        # 5. Send the POST request
         logger.info("Sending audio to the cloud... ☁️")
-        response = session.post(cloud_function_url, data=flac_audio_data, headers=headers)
+        response = session.post(
+            cloud_function_url,
+            data=flac_audio_data,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
         t_cloud = time.perf_counter()
         logger.info(f"[TIMING] Cloud round-trip (upload + STT + LLM): {t_cloud - t_flac:.3f}s")
 
-        # 6. Handle the response from the Cloud Function
         if response.status_code == 200:
-            # Success! The response.text contains the final text from the LLM.
             llm_response = response.text
             logger.info(f"✅ LLM Response: {llm_response}")
             return llm_response
-        
-        else:
-            # If something went wrong, print the error.
-            logger.error(f"❌ Error: {response.status_code}")
-            logger.error(f"Message: {response.text}")
+
+        logger.error(f"❌ Error: {response.status_code}")
+        logger.error(f"Message: {response.text}")
+        return None
 
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
+        return None

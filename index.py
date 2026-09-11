@@ -1,7 +1,6 @@
 import speech_recognition as sr
 import requests
 import subprocess
-# from elevenlabs import stream, VoiceSettings
 import sys
 import os
 import glob
@@ -12,7 +11,7 @@ import logging
 import time
 import yaml
 import argparse
-from google_interface import process_audio, cloud_function_url
+from google_interface import process_audio, cloud_function_url, auth_headers, set_shared_secret
 
 # Enable passing arguments to set Recognizer properties
 def parse_args():
@@ -20,12 +19,16 @@ def parse_args():
     parser.add_argument('--config', type=str, default='config.yml', help='Path to the config file')
     return parser.parse_args()
 
-# load config from yaml file
-with open(parse_args().config, 'r') as f:
-    try:
+# load config from yaml file. Bail out immediately on a bad/missing file rather
+# than limping on with `config` undefined and failing with a NameError below.
+_config_path = parse_args().config
+try:
+    with open(_config_path, 'r') as f:
         config = yaml.safe_load(f)
-    except yaml.YAMLError as e:
-        print(f"Error loading config file: {e}")
+except (OSError, yaml.YAMLError) as e:
+    sys.exit(f"Error loading config file {_config_path}: {e}")
+if not isinstance(config, dict):
+    sys.exit(f"Config file {_config_path} is empty or malformed")
 
 # initialize logger
 logger = logging.getLogger(__name__)
@@ -43,8 +46,12 @@ for _handler in logging.getLogger().handlers:
 VOICE_ID = config['eleven_labs']['voice_id']
 URL = config['eleven_labs']['url']
 ELEVENLABS_API_KEY = config['eleven_labs']['api_key']
-GOOGLE_CLOUD_KEY = config['google_cloud']['api_key']
 CHUNK_SIZE = config['general']['chunk_size']
+
+# Optional shared secret for the cloud function. The Cloud Run endpoint is public,
+# so without this anyone who finds the URL can run STT + Gemini on our bill.
+set_shared_secret((config.get('google_cloud') or {}).get('shared_secret'))
+
 # Hard cap on how long a single utterance is recorded before we cut it off.
 # pause_threshold (the silence gap) is what normally ends a phrase; this is just
 # a safety limit for someone who never stops talking. Falls back to 5s.
@@ -69,6 +76,10 @@ PIR_LISTEN_POLL_TIMEOUT = _pir_cfg.get('listen_poll_timeout', 1.0)
 # Lower sample rate = less data to transfer/buffer; 22050 is plenty for speech.
 TTS_SAMPLE_RATE = 22050
 TTS_OUTPUT_FORMAT = f"pcm_{TTS_SAMPLE_RATE}"
+
+# (connect, read) timeouts for ElevenLabs. Without a read timeout a stalled
+# stream hangs the main loop indefinitely with the mic paused and the LEDs stuck.
+TTS_TIMEOUT = (5, 30)
 
 # Initialize speech recognizer
 r = sr.Recognizer()
@@ -96,6 +107,15 @@ def build_player_cmd():
     return ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(TTS_SAMPLE_RATE), "-c", "1", "-"]
 
 
+def _close_player(player_proc):
+    """Close the player's stdin and wait for it, tolerating an already-dead player."""
+    try:
+        player_proc.stdin.close()
+    except OSError:
+        pass
+    player_proc.wait()
+
+
 def elevenlabs_stream(text):
     headers = {
         "Content-Type": "application/json",
@@ -114,25 +134,30 @@ def elevenlabs_stream(text):
     logger.info("Sending text-to-speech request...")
     t_request = time.perf_counter()
     response = tts_session.post(URL, params={"output_format": TTS_OUTPUT_FORMAT},
-                                json=data, headers=headers, stream=True)
+                                json=data, headers=headers, stream=True,
+                                timeout=TTS_TIMEOUT)
     logger.info(f"[TIMING] TTS response headers received: {time.perf_counter() - t_request:.3f}s")
+
+    # An error body (401, 429, ...) is JSON, not PCM: piping it to the player
+    # would make Jack spit out a burst of static. Fail loudly instead.
+    response.raise_for_status()
 
     # Pipe the raw PCM straight to the platform's audio player (no decode step)
     player_proc = subprocess.Popen(build_player_cmd(), stdin=subprocess.PIPE)
-    chunk_progress = 0
-    first_chunk = True
-    for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-        if chunk:
-            if first_chunk:
-                logger.info(f"[TIMING] TTS first audio chunk piped to player: {time.perf_counter() - t_request:.3f}s")
-                first_chunk = False
-            player_proc.stdin.write(chunk)
-            chunk_progress += len(chunk)
-            # logger.info(f"Received {chunk_progress} bytes of audio data.")
-
-    # close the player process when finished
-    player_proc.stdin.close()
-    player_proc.wait()
+    try:
+        first_chunk = True
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+            if chunk:
+                if first_chunk:
+                    logger.info(f"[TIMING] TTS first audio chunk piped to player: {time.perf_counter() - t_request:.3f}s")
+                    first_chunk = False
+                player_proc.stdin.write(chunk)
+    except BrokenPipeError:
+        # Player died mid-stream (no audio device, killed process). Drop the
+        # rest of the audio rather than taking the interaction down with it.
+        logger.warning("Audio player exited early; dropping the rest of the speech")
+    finally:
+        _close_player(player_proc)
     
 
 # The LED script runs as root (via sudo) while index.py runs as a normal user,
@@ -153,16 +178,36 @@ def set_lights(state):
         logger.warning(f"Could not set LED state: {e}")
 
 
+# The LED process keeps running for a moment after we write 'idle' while it
+# fades down. Hold on to it so a fast follow-up interaction waits for it to exit
+# instead of starting a second process against the same DMA channel.
+_lights_proc = None
+
+
 def start_lights(initial="thinking"):
     """Spawn the single LED process for one interaction, starting in `initial`
     ('thinking' for a normal turn, 'speaking' for a proactive greeting that has
     no thinking phase). It exits on its own once the state becomes 'idle',
     settling to the glow."""
+    global _lights_proc
+    if _lights_proc is not None and _lights_proc.poll() is None:
+        # Previous interaction is still fading down. Wait it out so only one
+        # process ever drives the strip.
+        try:
+            _lights_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            logger.warning("Previous LED process did not exit; terminating it")
+            _lights_proc.terminate()
+            try:
+                _lights_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                _lights_proc.kill()
     set_lights(initial)
-    return subprocess.Popen(
+    _lights_proc = subprocess.Popen(
         ["sudo", "python", "led_animations.py",
          "--statefile", _LIGHTS_STATEFILE, "--glow", str(IDLE_GLOW_BRIGHTNESS)]
     )
+    return _lights_proc
 
 
 def set_idle_glow():
@@ -177,28 +222,27 @@ def set_idle_glow():
 def handle_audio(audio):
     t_phrase_end = time.perf_counter()
 
-    lights = None
     try:
-        lights = start_lights()  # single process, starts in 'thinking'
+        start_lights()  # single process, starts in 'thinking'
 
         logger.info("Recognizing audio...")
         text = process_audio(audio)
         logger.info(f"AI response: {text}")
 
-        # Call ElevenLabs to speak
-        if text is not None:
+        # Call ElevenLabs to speak. An empty body (not just None) means STT or the
+        # LLM gave us nothing usable, so there is nothing to say.
+        if text:
             set_lights("speaking")
             logger.info("Speaking response...")
             logger.info(f"[TIMING] End of speech to TTS start: {time.perf_counter() - t_phrase_end:.3f}s")
             elevenlabs_stream(text)
-            # stream(text_to_speech_stream(ai_text))
         else:
             logger.info("Couldn't understand speech.")
 
-    except sr.UnknownValueError:
-        print("Could not understand audio")
-    except sr.RequestError as e:
-        print("Could not request results; {0}".format(e))
+    except Exception:
+        # Jack runs unattended all night: a TTS error, a dead audio player or a
+        # network blip must never take the listen loop down with it.
+        logger.exception("Interaction failed; staying alive for the next visitor")
     finally:
         # Interaction over (success, garbled speech, or error): the LED process
         # reads 'idle', settles to the dim glow, and exits.
@@ -264,7 +308,9 @@ def _warmup():
     Fire-and-forget on its own thread; failures are harmless (worst case the
     first real request pays the cold start it always did)."""
     try:
-        _warmup_session.post(cloud_function_url, headers={"X-Warmup": "1"}, timeout=8)
+        headers = {"X-Warmup": "1"}
+        headers.update(auth_headers())
+        _warmup_session.post(cloud_function_url, headers=headers, timeout=8)
         logger.info("PIR: warmed cloud function")
     except Exception as e:
         logger.warning(f"PIR warmup failed: {e}")
@@ -293,8 +339,11 @@ def setup_pir():
         return
     try:
         _pir_sensor = MotionSensor(PIR_GPIO)
-        _pir_sensor.when_motion = _on_motion
+        # Start the settle clock BEFORE attaching the callback: a motion edge in
+        # between would otherwise compare against _pir_start == 0.0, pass the
+        # startup-ignore check, and queue a greeting from a power-on false trigger.
         _pir_start = time.monotonic()
+        _pir_sensor.when_motion = _on_motion
         logger.info(
             f"PIR armed on GPIO {PIR_GPIO} "
             f"(ignoring motion for the first {PIR_STARTUP_IGNORE}s)"
@@ -313,10 +362,50 @@ def play_greeting():
     with open(random.choice(clips), "rb") as f:
         pcm = f.read()
     player_proc = subprocess.Popen(build_player_cmd(), stdin=subprocess.PIPE)
-    player_proc.stdin.write(pcm)
-    player_proc.stdin.close()
-    player_proc.wait()
+    try:
+        player_proc.stdin.write(pcm)
+    except BrokenPipeError:
+        logger.warning("Audio player exited early; greeting cut short")
+    finally:
+        _close_player(player_proc)
     return True
+
+
+# monotonic timestamps gating proactive greetings (main thread only)
+_last_greeting = 0.0
+_last_interaction = 0.0
+
+
+def service_greeting(source):
+    """Play a proactive greeting if the PIR asked for one and cooldowns allow it.
+
+    Runs on the main loop between listens, so all mic/speaker/LED work stays on
+    one thread. A recent interaction suppresses greetings so we don't talk over
+    a conversation already in progress.
+    """
+    global _last_greeting
+    if not _greeting_request.is_set():
+        return
+    _greeting_request.clear()
+    now = time.monotonic()
+    if (now - _last_greeting < PIR_GREETING_COOLDOWN or
+            now - _last_interaction < PIR_GREETING_COOLDOWN):
+        return
+
+    pause_capture(source)
+    try:
+        start_lights("speaking")  # no thinking phase for a greeting
+        logger.info("PIR: speaking a proactive greeting")
+        # A greeting is our best signal a conversation is imminent, so warm the
+        # cloud now. Runs concurrently with the clip, so the instance is hot
+        # before the visitor answers.
+        threading.Thread(target=_warmup, daemon=True).start()
+        play_greeting()
+    finally:
+        set_lights("idle")
+        resume_capture(source)
+        drain_mic(source)
+        _last_greeting = time.monotonic()
 
 
 # Settle the lantern into its dim idle glow while it waits for the first visitor.
@@ -331,50 +420,35 @@ setup_pir()
 # service a proactive greeting the PIR thread has requested. All mic/speaker/LED
 # work stays on this thread; the sensor thread only sets the request event.
 logger.info("Started listening")
-# monotonic timestamps gating proactive greetings (main thread only)
-_last_greeting = 0.0
-_last_interaction = 0.0
 try:
     with m as source:
         while True:
             try:
-                audio = r.listen(source, timeout=PIR_LISTEN_POLL_TIMEOUT,
-                                 phrase_time_limit=PHRASE_TIME_LIMIT)
-            except sr.WaitTimeoutError:
-                # No speech this window. If the PIR asked for a greeting and the
-                # cooldowns allow it, greet now. A recent interaction suppresses
-                # greetings so we don't talk over an ongoing conversation.
-                if _greeting_request.is_set():
-                    _greeting_request.clear()
-                    now = time.monotonic()
-                    if (now - _last_greeting >= PIR_GREETING_COOLDOWN and
-                            now - _last_interaction >= PIR_GREETING_COOLDOWN):
-                        pause_capture(source)
-                        try:
-                            start_lights("speaking")  # no thinking phase for a greeting
-                            logger.info("PIR: speaking a proactive greeting")
-                            # A greeting is our best signal a conversation is
-                            # imminent, so warm the cloud now. Runs concurrently
-                            # with the clip, so the instance is hot before the
-                            # visitor answers.
-                            threading.Thread(target=_warmup, daemon=True).start()
-                            play_greeting()
-                        finally:
-                            set_lights("idle")
-                            resume_capture(source)
-                            drain_mic(source)
-                            _last_greeting = time.monotonic()
-                continue
+                try:
+                    audio = r.listen(source, timeout=PIR_LISTEN_POLL_TIMEOUT,
+                                     phrase_time_limit=PHRASE_TIME_LIMIT)
+                except sr.WaitTimeoutError:
+                    # No speech this window: a good moment to greet a passerby.
+                    service_greeting(source)
+                    continue
 
-            pause_capture(source)
-            try:
-                handle_audio(audio)
-            finally:
-                resume_capture(source)
-                drain_mic(source)
-                # A real interaction resets the greeting timer: the visitor is
-                # already engaged, so don't greet them on top of it.
-                _last_interaction = time.monotonic()
+                pause_capture(source)
+                try:
+                    handle_audio(audio)
+                finally:
+                    resume_capture(source)
+                    drain_mic(source)
+                    # A real interaction resets the greeting timer: the visitor is
+                    # already engaged, so don't greet them on top of it.
+                    _last_interaction = time.monotonic()
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                # Last line of defence. Jack is unattended on a porch all night;
+                # no single bad turn is allowed to end the loop. Pause briefly so
+                # a persistent fault (e.g. the mic disappearing) doesn't spin.
+                logger.exception("Listen loop error; continuing")
+                time.sleep(1)
 except KeyboardInterrupt:
     logger.info("Stopping.")
 finally:

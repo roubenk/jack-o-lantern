@@ -1,4 +1,7 @@
+import hmac
+import os
 import time
+
 import functions_framework
 from google.cloud import speech
 from google import genai
@@ -39,6 +42,24 @@ except Exception as e:
     logger.error(f"FATAL: Failed to initialize Speech Client: {e}")
     SPEECH_CLIENT = None
 
+# Shared secret the Pi must present. This endpoint is publicly reachable, so
+# without it anyone who finds the URL can run STT + Gemini on our bill. Set the
+# JACK_SHARED_SECRET env var on the service and the matching
+# `google_cloud.shared_secret` in the Pi's config.yml.
+SHARED_SECRET = os.environ.get("JACK_SHARED_SECRET")
+if not SHARED_SECRET:
+    logger.warning(
+        "JACK_SHARED_SECRET is not set: this endpoint is unauthenticated and "
+        "anyone with the URL can spend STT/LLM quota."
+    )
+
+
+def _authorized(request):
+    """Constant-time check of the caller's shared secret (open if unconfigured)."""
+    if not SHARED_SECRET:
+        return True
+    return hmac.compare_digest(request.headers.get("X-Jack-Secret", ""), SHARED_SECRET)
+
 
 @functions_framework.http
 def respond_to_speech(request):
@@ -50,6 +71,10 @@ def respond_to_speech(request):
     Returns:
         The LLM's text response.
     """
+    if not _authorized(request):
+        logger.warning("Rejected a request with a missing or incorrect shared secret")
+        return "Forbidden", 403
+
     # Warmup ping: the Pi fires this when the PIR sees someone approaching, to
     # spin up (or keep) a warm instance before the visitor actually speaks. By the
     # time this handler runs the module is imported and the clients below are
@@ -80,8 +105,11 @@ def respond_to_speech(request):
         transcript = response.results[0].alternatives[0].transcript
         logger.info(f"[TIMING] STT: {time.perf_counter() - t_stt_start:.3f}s")
         logger.info(f"User said: {transcript}")
-    except Exception as e:
-        return f"Error in transcription: {e}", 500
+    except Exception:
+        # Log the detail; return something generic so an anonymous caller can't
+        # probe our internals through error messages.
+        logger.exception("Speech-to-text failed")
+        return "Error in transcription.", 500
 
     # 3. Call the Gemini LLM via Vertex AI
     try:
@@ -119,11 +147,18 @@ def respond_to_speech(request):
             contents=visitor_turn,
             config=llm_config
         )
-        final_response = llm_response.text
+        # .text is None when the model returns no candidate (safety block, or
+        # the max_output_tokens cap hit before any text). Normalize to "" so the
+        # caller gets a body it can test rather than the string "None".
+        final_response = llm_response.text or ""
         logger.info(f"[TIMING] LLM: {time.perf_counter() - t_llm_start:.3f}s")
-        logger.info(f"Jack said: {final_response}")
-    except Exception as e:
-        return f"Error generating LLM response: {e}", 500
+        if not final_response:
+            logger.warning("LLM returned no text (safety block or token cap); staying silent")
+        else:
+            logger.info(f"Jack said: {final_response}")
+    except Exception:
+        logger.exception("LLM generation failed")
+        return "Error generating LLM response.", 500
 
     # 4. Return the final text response
     return final_response, 200

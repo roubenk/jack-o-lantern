@@ -1,0 +1,4 @@
+# Dependencies for the Cloud Run / Cloud Functions handler (main.py).
+functions-framework>=3.5.0
+google-cloud-speech>=2.24.0
+google-genai>=1.0.0
