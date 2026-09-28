@@ -2,6 +2,8 @@ import speech_recognition as sr
 import requests
 import subprocess
 import sys
+import array
+import math
 import os
 import glob
 import random
@@ -11,6 +13,14 @@ import logging
 import time
 import yaml
 import argparse
+
+try:
+    # C-speed RMS. Stdlib through Python 3.12, removed in 3.13; we fall back to
+    # a pure-Python loop, which is still far cheaper than the cloud call it saves.
+    import audioop as _audioop
+except ImportError:
+    _audioop = None
+
 from google_interface import process_audio, cloud_function_url, auth_headers, set_shared_secret
 
 # Enable passing arguments to set Recognizer properties
@@ -57,6 +67,21 @@ set_shared_secret((config.get('google_cloud') or {}).get('shared_secret'))
 # a safety limit for someone who never stops talking. Falls back to 5s.
 PHRASE_TIME_LIMIT = config['general'].get('phrase_time_limit', 5)
 
+# Local gate on what listen() hands us. It returns on any sound above the energy
+# threshold, and the library's own phrase_threshold only discards bursts shorter
+# than a fraction of a second. Anything longer -- a car door, a shout from the
+# street, two people talking as they pass -- arrives looking just like a question.
+#
+# Both thresholds default to OFF, because the right values depend on your mic and
+# your porch. Every capture is logged with its measurements (lines beginning
+# "Capture:"), so set these from your own numbers rather than from a guess.
+MIN_CAPTURE_SECONDS = config['general'].get('min_capture_seconds', 0.0)
+MIN_VOICED_SECONDS = config['general'].get('min_voiced_seconds', 0.0)
+# RMS amplitude a 20ms window must reach to count as voiced. Defaults to the
+# recognizer's own energy_threshold, so it tracks whatever you tuned there.
+VOICED_FLOOR = (config['general'].get('voiced_floor')
+                or config['recognizer_properties']['energy_threshold'])
+
 # Dim orange glow (0-255) the lantern holds between interactions. 0 = fully off
 # to save battery; higher = brighter idle glow but more continuous current draw.
 IDLE_GLOW_BRIGHTNESS = config['general'].get('idle_glow_brightness', 20)
@@ -71,6 +96,16 @@ GREETINGS_DIR = _pir_cfg.get('greetings_dir', 'greetings')
 PIR_STARTUP_IGNORE = _pir_cfg.get('startup_ignore_seconds', 60)
 PIR_GREETING_COOLDOWN = _pir_cfg.get('greeting_cooldown', 45)
 PIR_LISTEN_POLL_TIMEOUT = _pir_cfg.get('listen_poll_timeout', 1.0)
+
+# Only act on captured audio when the sensor has seen someone recently. Noise with
+# nobody standing there is noise by definition, and ignoring it is what buys the
+# headroom to make the mic more sensitive for the people who ARE there.
+# Off by default, and bypassed entirely when the sensor is disabled or failed to
+# arm -- a permanently deaf Jack is far worse than an occasional false trigger.
+PIR_REQUIRE_MOTION = _pir_cfg.get('require_motion', False)
+# PIRs report movement, not presence: they go inactive when someone stands still
+# to talk. So gate on motion seen within this window, not on the sensor's live state.
+PIR_PRESENCE_WINDOW = _pir_cfg.get('presence_window', 30)
 
 # Request raw PCM from ElevenLabs (no MP3 decode on playback). 16-bit signed LE, mono.
 # Lower sample rate = less data to transfer/buffer; 22050 is plenty for speech.
@@ -89,6 +124,12 @@ r.pause_threshold = config['recognizer_properties']['pause_threshold']
 r.non_speaking_duration = config['recognizer_properties']['non_speaking_duration']
 r.energy_threshold = config['recognizer_properties']['energy_threshold']
 r.dynamic_energy_ratio = config['recognizer_properties']['dynamic_energy_ratio']
+# Minimum seconds of speaking audio before listen() calls a burst a phrase. This
+# is the library's own click-and-pop filter and the cheapest defence there is: a
+# burst below it is discarded INSIDE listen(), so it never returns, never reaches
+# the cloud, and costs no deafness at all. Library default is 0.3s; raising it to
+# 0.5-0.6 is the first knob to try against short noise triggers.
+r.phrase_threshold = config['recognizer_properties'].get('phrase_threshold', 0.3)
 
 m = sr.Microphone(chunk_size=config['microphone_properties']['chunk_size'])
 
@@ -309,6 +350,8 @@ def drain_mic(source):
 # for a false trigger).
 _greeting_request = threading.Event()
 _pir_start = 0.0        # monotonic time the sensor was armed (for startup settle)
+_last_motion = 0.0      # monotonic time of the last motion edge (written by the
+                        # sensor thread, read by the main loop for motion gating)
 _pir_sensor = None      # keep a reference so gpiozero doesn't close the device
 _warmup_session = requests.Session()
 
@@ -328,6 +371,10 @@ def _warmup():
 
 def _on_motion():
     """gpiozero callback (sensor thread) fired on each rising edge of the PIR."""
+    global _last_motion
+    # Record presence BEFORE the settle check. The startup window exists to stop
+    # false greetings, not to make Jack deaf, and motion gating reads this value.
+    _last_motion = time.monotonic()
     # Ignore the settling period after power-on, when PIRs emit false triggers.
     if time.monotonic() - _pir_start < PIR_STARTUP_IGNORE:
         return
@@ -379,6 +426,90 @@ def play_greeting():
     finally:
         _close_player(player_proc)
     return True
+
+
+# --- Deciding which captures earn a cloud call -------------------------------
+# A capture we accept costs a round trip AND about a second of deafness while we
+# handle it, and that deafness lands exactly when a real visitor is likely
+# mid-sentence. That is the mechanism by which background noise crowds out real
+# speech. So measure each capture here, on the Pi, and drop what cannot plausibly
+# be someone talking to Jack. Rejection costs a few milliseconds against the
+# ~330ms round trip it saves.
+
+_VOICED_WINDOW_SECONDS = 0.02   # 20ms, the usual granularity for this kind of check
+
+
+def _window_rms(chunk):
+    """RMS amplitude of one 16-bit mono chunk, in the same units as
+    Recognizer.energy_threshold, so VOICED_FLOOR is comparable to it."""
+    if _audioop is not None:
+        return _audioop.rms(chunk, 2)
+    samples = array.array('h')
+    samples.frombytes(chunk)
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(s * s for s in samples) / len(samples))
+
+
+def measure_capture(audio):
+    """Return (duration_seconds, voiced_seconds) for a capture.
+
+    voiced_seconds counts how much of the clip reaches VOICED_FLOOR, in 20ms
+    windows -- a crude voice-activity measure. It matters because duration alone
+    is misleading: listen() keeps non_speaking_duration of silence on BOTH sides,
+    so a third-of-a-second car door comes back as a respectable-looking 1.3s clip.
+    Speech sustains energy across many windows; a bang does not. voiced_seconds is
+    None when the format isn't 16-bit, in which case we make no judgement.
+    """
+    data = audio.frame_data
+    rate = audio.sample_rate
+    width = audio.sample_width
+    duration = len(data) / float(rate * width) if rate and width else 0.0
+    if width != 2 or not data:
+        return duration, None
+    step = max(2, int(rate * _VOICED_WINDOW_SECONDS) * 2)   # bytes per window
+    voiced_windows = 0
+    windows = 0
+    for i in range(0, len(data) - step + 1, step):
+        windows += 1
+        if _window_rms(data[i:i + step]) >= VOICED_FLOOR:
+            voiced_windows += 1
+    if not windows:
+        return duration, None
+    return duration, voiced_windows * (step / 2.0) / rate
+
+
+def accept_capture(audio):
+    """Decide whether a capture is worth handling. Returns (accept, reason).
+
+    Every capture is logged with its measurements whether it passes or not, so the
+    thresholds can be tuned from real numbers off your own porch.
+    """
+    try:
+        duration, voiced = measure_capture(audio)
+    except Exception as e:
+        # Never let a measurement bug make Jack deaf: if we cannot judge the
+        # capture, handle it as we always did.
+        logger.warning(f"Could not measure capture, accepting it: {e}")
+        return True, ""
+    voiced_text = "n/a" if voiced is None else f"{voiced:.2f}s voiced"
+    logger.info(f"Capture: {duration:.2f}s long, {voiced_text} (floor {VOICED_FLOOR})")
+
+    if MIN_CAPTURE_SECONDS and duration < MIN_CAPTURE_SECONDS:
+        return False, f"below min_capture_seconds ({MIN_CAPTURE_SECONDS}s)"
+
+    if MIN_VOICED_SECONDS and voiced is not None and voiced < MIN_VOICED_SECONDS:
+        return False, f"below min_voiced_seconds ({MIN_VOICED_SECONDS}s)"
+
+    # Fail OPEN when the sensor is off or never armed: better an occasional false
+    # trigger than a Jack who cannot hear anyone at all.
+    if PIR_REQUIRE_MOTION and _pir_sensor is not None:
+        since = time.monotonic() - _last_motion
+        if since > PIR_PRESENCE_WINDOW:
+            seen = "no motion seen yet" if not _last_motion else f"no motion for {since:.0f}s"
+            return False, f"{seen} (presence_window {PIR_PRESENCE_WINDOW}s)"
+
+    return True, ""
 
 
 # monotonic timestamps gating proactive greetings (main thread only).
@@ -442,6 +573,13 @@ try:
                 except sr.WaitTimeoutError:
                     # No speech this window: a good moment to greet a passerby.
                     service_greeting(source)
+                    continue
+
+                # Judge the capture BEFORE stopping the mic, so a rejected one
+                # costs no deafness at all beyond its own recording.
+                accept, why = accept_capture(audio)
+                if not accept:
+                    logger.info(f"Ignoring capture: {why}")
                     continue
 
                 pause_capture(source)
